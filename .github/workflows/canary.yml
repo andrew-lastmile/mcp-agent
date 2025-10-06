@@ -1,4 +1,5 @@
 name: Canary Workflow
+
 on:
   schedule:
     - cron: "*/5 * * * *"
@@ -8,6 +9,9 @@ jobs:
   canary:
     environment: canary
     runs-on: ubuntu-latest
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      MCPAC_API_KEY: ${{ secrets.MCPAC_API_KEY }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
