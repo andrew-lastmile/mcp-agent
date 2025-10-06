@@ -1,0 +1,56 @@
+name: Canary Workflow
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+jobs:
+  canary:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Deploy
+        id: deploy
+        run: |
+          python canary/deploy_app.py > deploy_output.json
+        continue-on-error: false
+
+      - name: Test app
+        id: test
+        run: |
+          APP_URL=$(jq -r '.app_url' deploy_output.json)
+          python canary/test_app.py "$APP_URL" > test_output.json
+
+      - name: Log results
+        run: |
+          APP_ID=$(jq -r '.app_id' deploy_output.json)
+          STATUS=$(jq -r '.success' test_output.json)
+          TOTAL_LATENCY=$(jq -r '.latency_s' test_output.json)
+
+          DEPLOY_LATENCY=$(jq -r '.latency_s' deploy_output.json)
+          TEST_LATENCY=$(jq -r '.latency_s' test_output.json)
+          DELETE_LATENCY=$(jq -r '.latency_s' delete_output.json 2>/dev/null || echo 0)
+
+          DEPLOY_STDOUT=$(jq -r '.output' deploy_output.json)
+          DEPLOY_STDERR=$(jq -r '.stderr // ""' deploy_output.json)
+          TEST_STDOUT=$(jq -r '.stdout' test_output.json)
+          TEST_STDERR=$(jq -r '.stderr' test_output.json)
+          DELETE_STDOUT=$(jq -r '.stdout // ""' delete_output.json 2>/dev/null || echo "")
+          DELETE_STDERR=$(jq -r '.stderr // ""' delete_output.json 2>/dev/null || echo "")
+
+          python canary/log_result.py \
+            "$STATUS" "$APP_ID" "$TOTAL_LATENCY" \
+            "$DEPLOY_LATENCY" "$TEST_LATENCY" "$DELETE_LATENCY" \
+            "$DEPLOY_STDOUT" "$DEPLOY_STDERR" \
+            "$TEST_STDOUT" "$TEST_STDERR" \
+            "$DELETE_STDOUT" "$DELETE_STDERR"
+
+      - name: Cleanup
+        if: always()
+        run: |
+          APP_ID=$(jq -r '.app_id' deploy_output.json)
+          python canary/delete_app.py "$APP_ID"
