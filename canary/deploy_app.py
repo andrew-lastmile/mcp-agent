@@ -8,6 +8,8 @@ import os
 
 api_key = os.environ.get("MCPAC_API_KEY")
 
+cwd_path = os.path.join(os.path.dirname(__file__), "basic-agent")
+
 def deploy_app():
     print("🚀 Starting deployment...")
     start = time.time()
@@ -18,7 +20,7 @@ def deploy_app():
         stderr=subprocess.STDOUT,
         stdin=subprocess.PIPE,
         text=True,
-        cwd="basic-agent",
+        cwd=cwd_path,
         bufsize=1,
     )
 
