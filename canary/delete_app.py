@@ -5,7 +5,7 @@ import time
 import json
 import os
 
-api_key = os.environ.get("OPENAI_API_KEY")
+api_key = os.environ.get("MCPAC_API_KEY")
 
 def delete_app(app_id):
     print(f"🗑️  Deleting app {app_id}...")
