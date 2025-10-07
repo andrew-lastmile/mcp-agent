@@ -41,6 +41,21 @@ jobs:
           APP_URL=$(jq -r '.app_url' deploy_output.json)
           python canary/test_app.py "$APP_URL" | tee full_test.log | tail -n 1 > test_output.json
 
+      - name: Normalize status
+        if: always()
+        run: |
+          if jq -e .success test_output.json >/dev/null 2>&1; then
+            SUCCESS=$(jq -r '.success' test_output.json)
+            if [ "$SUCCESS" = "true" ]; then
+              STATUS="success"
+            else
+              STATUS="failure"
+            fi
+          else
+            STATUS="error"
+          fi
+          echo "STATUS=$STATUS" >> $GITHUB_ENV
+
       - name: Log results
         id: log
         run: |
@@ -92,25 +107,38 @@ jobs:
           webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
           webhook-type: incoming-webhook
           payload: |
-            text: "MCP Canary run completed — *${{ env.STATUS }}*"
+            text: "MCP Canary Run — ${{ env.STATUS }}"
             blocks:
-              - type: "section"
+              - type: "header"
                 text:
-                  type: "mrkdwn"
-                  text: "*MCP Canary Run Results*"
+                  type: "plain_text"
+                  text: "${{ env.STATUS == 'success' && '✅ Canary Passed' || env.STATUS == 'failure' && '❌ Canary Failed' || '⚠️ Canary Error' }}"
               - type: "section"
                 fields:
-                  - type: "mrkdwn"
-                    text: "*Status:*\n${{ env.STATUS }}"
                   - type: "mrkdwn"
                     text: "*App ID:*\n${{ env.APP_ID }}"
                   - type: "mrkdwn"
                     text: "*Total Latency:*\n${{ env.TOTAL_LATENCY }}s"
+                  - type: "mrkdwn"
+                    text: "*Deploy Latency:*\n${{ env.DEPLOY_LATENCY }}s"
+                  - type: "mrkdwn"
+                    text: "*Test Latency:*\n${{ env.TEST_LATENCY }}s"
+              - type: "divider"
+              - type: "section"
+                text:
+                  type: "mrkdwn"
+                  text: >
+                    *🧩 Deploy Output (truncated)*\n```${{ env.DEPLOY_STDOUT }}```
+              - type: "section"
+                text:
+                  type: "mrkdwn"
+                  text: >
+                    *🧪 Test Output (truncated)*\n```${{ env.TEST_STDOUT }}```
               - type: "context"
                 elements:
                   - type: "mrkdwn"
-                    text: "_Triggered by GitHub Actions Canary Job — <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View logs>_"
-
+                    text: "_Triggered by <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|GitHub Actions Canary Job>_"
+      
       - name: Upload logs to Slack
         if: always()
         run: |
