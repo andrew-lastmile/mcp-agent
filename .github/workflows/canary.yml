@@ -138,7 +138,6 @@ jobs:
           webhook-type: incoming-webhook
           payload: |
             {
-              "text": "Canary Status: ${{ env.STATUS }}",
               "attachments": [
                 {
                   "color": "${{ env.STATUS == 'success' && '#36a64f' || env.STATUS == 'failure' && '#e01e5a' || '#f2c744' }}",
@@ -153,8 +152,8 @@ jobs:
                       "type": "context",
                       "elements": [
                         { "type": "mrkdwn", "text": "*Status:* `${{ env.STATUS }}`" },
-                        { "type": "mrkdwn", "text": "*Deploy App:* `${{ env.DEPLOY_SUCCESS == 'true' && '✅' || '❌' }}`" },
-                        { "type": "mrkdwn", "text": "*Tool Calls:* `${{ env.TEST_SUCCESS == 'true' && '✅' || '❌' }}`" }
+                        { "type": "mrkdwn", "text": "*Deploy App:* ${{ env.DEPLOY_SUCCESS == 'true' && '✅' || '❌' }}" },
+                        { "type": "mrkdwn", "text": "*Tool Calls:* ${{ env.TEST_SUCCESS == 'true' && '✅' || '❌' }}" }
                       ]
                     },
                     {
