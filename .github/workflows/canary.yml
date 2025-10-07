@@ -121,21 +121,24 @@ jobs:
                 {
                   "color": "${{ env.STATUS == 'success' && '#36a64f' || env.STATUS == 'failure' && '#9ca3af' || '#e01e5a' }}",
                   "blocks": [
+                    /* ── Top meta (small font) ─────────────────────────────── */
                     {
                       "type": "context",
                       "elements": [
-                        { "type": "mrkdwn", "text": "${{ env.STATUS == 'success' && '✅ *GitHub Actions Canary Passed*' || env.STATUS == 'failure' && '🪦 *GitHub Actions Canary Failed*' || '❌ *GitHub Actions Canary Error*' }}" }
+                        { "type": "mrkdwn", "text": "*App ID:* `${{ env.APP_ID }}`" }
                       ]
                     },
                     {
                       "type": "context",
                       "elements": [
-                        { "type": "mrkdwn", "text": "*App ID:* `${{ env.APP_ID }}`" },
+                        { "type": "mrkdwn", "text": "*Status:* `${{ env.STATUS }}`" },
                         { "type": "mrkdwn", "text": "*Total:* `${{ env.TOTAL_LATENCY }}s`" },
                         { "type": "mrkdwn", "text": "*Deploy:* `${{ env.DEPLOY_LATENCY }}s`" },
                         { "type": "mrkdwn", "text": "*Test:* `${{ env.TEST_LATENCY }}s`" }
                       ]
                     },
+      
+                    /* ── Deploy output ─────────────────────────────────────── */
                     {
                       "type": "context",
                       "elements": [
@@ -148,6 +151,11 @@ jobs:
                         { "type": "mrkdwn", "text": ${{ env.DEPLOY_STDOUT_ESCAPED }} }
                       ]
                     },
+      
+                    /* Divider between sections */
+                    { "type": "divider" },
+      
+                    /* ── Tool Call output ──────────────────────────────────── */
                     {
                       "type": "context",
                       "elements": [
@@ -160,6 +168,8 @@ jobs:
                         { "type": "mrkdwn", "text": ${{ env.TEST_STDOUT_ESCAPED }} }
                       ]
                     },
+      
+                    /* ── Footer / provenance ──────────────────────────────── */
                     {
                       "type": "context",
                       "elements": [
