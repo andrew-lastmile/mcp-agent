@@ -22,6 +22,11 @@ jobs:
         run: |
           pip install uv
           uv pip install -e . --system
+          # Individually add required packages
+          uv pip install fastmcp --system
+          uv pip install httpx --system
+          uv pip install pydantic --system
+          uv pip install rich --system
           uv version
 
       - name: Deploy
