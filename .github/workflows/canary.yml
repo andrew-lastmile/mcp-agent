@@ -60,20 +60,21 @@ jobs:
         id: log
         run: |
           APP_ID=$(jq -r '.app_id // empty' deploy_output.json)
-          STATUS=$(jq -r '.success // "unknown"' test_output.json)
           DEPLOY_LATENCY=$(jq -r '.latency_s // 0' deploy_output.json)
           TEST_LATENCY=$(jq -r '.latency_s // 0' test_output.json)
           TOTAL_LATENCY=$(echo "$DEPLOY_LATENCY + $TEST_LATENCY" | bc)
           DEPLOY_STDOUT=$(jq -r '.output // ""' deploy_output.json)
-          DEPLOY_STDERR=$(jq -r '.stderr // ""' deploy_output.json)
           TEST_STDOUT=$(jq -r '.stdout // ""' test_output.json)
-          TEST_STDERR=$(jq -r '.stderr // ""' test_output.json)
-
+          DEPLOY_SUCCESS=$(jq -r '.success // false' deploy_output.json)
+          TEST_SUCCESS=$(jq -r '.success // false' test_output.json)
+          STATUS=$(jq -r '.success // "unknown"' test_output.json)
+      
           echo "📊 Logging results for app_id=$APP_ID (status=$STATUS)"
           echo "  Deploy latency: ${DEPLOY_LATENCY}s"
           echo "  Test latency:   ${TEST_LATENCY}s"
           echo "  Total latency:  ${TOTAL_LATENCY}s"
-
+      
+          # Run your Python log script
           python canary/log_result.py \
             "$STATUS" \
             "$APP_ID" \
@@ -81,17 +82,27 @@ jobs:
             "$DEPLOY_LATENCY" \
             "$TEST_LATENCY" \
             "$DEPLOY_STDOUT" \
-            "$DEPLOY_STDERR" \
+            "" \
             "$TEST_STDOUT" \
-            "$TEST_STDERR"
-
-          # Export for Slack
-          echo "STATUS=$STATUS" >> $GITHUB_ENV
-          echo "APP_ID=$APP_ID" >> $GITHUB_ENV
-          echo "TOTAL_LATENCY=$TOTAL_LATENCY" >> $GITHUB_ENV
-          echo "DEPLOY_STDOUT=$(echo "$DEPLOY_STDOUT" | tail -c 500 | jq -Rs .)" >> $GITHUB_ENV
-          echo "TEST_STDOUT=$(echo "$TEST_STDOUT" | tail -c 500 | jq -Rs .)" >> $GITHUB_ENV
-
+            ""
+      
+          # ✅ Export all environment vars for later steps
+          {
+            echo "STATUS=$STATUS"
+            echo "APP_ID=$APP_ID"
+            echo "DEPLOY_LATENCY=$DEPLOY_LATENCY"
+            echo "TEST_LATENCY=$TEST_LATENCY"
+            echo "TOTAL_LATENCY=$TOTAL_LATENCY"
+            echo "DEPLOY_SUCCESS=$DEPLOY_SUCCESS"
+            echo "TEST_SUCCESS=$TEST_SUCCESS"
+            echo "DEPLOY_STDOUT<<EOF"
+            echo "$DEPLOY_STDOUT" | tail -c 500
+            echo "EOF"
+            echo "TEST_STDOUT<<EOF"
+            echo "$TEST_STDOUT" | tail -c 500
+            echo "EOF"
+          } >> $GITHUB_ENV
+          
       - name: Cleanup
         if: always()
         run: |
@@ -107,42 +118,38 @@ jobs:
           webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
           webhook-type: incoming-webhook
           payload: |
-            blocks:
-              - type: "header"
-                text:
-                  type: "plain_text"
-                  text: "${{ env.STATUS == 'success' && '✅ GitHub Actions Canary Passed' || env.STATUS == 'failure' && '❌ GitHub Actions Canary Failed' || '⚠️ GitHub Actions Canary Error' }}"
-              - type: "section"
-                fields:
-                  - type: "mrkdwn"
-                    text: "*App ID:*\n${{ env.APP_ID }}"
-                  - type: "mrkdwn"
-                    text: "*Total Latency:*\n*${{ env.TOTAL_LATENCY }}s*"
-                  - type: "mrkdwn"
-                    text: "*Deploy Latency:*\n${{ env.DEPLOY_LATENCY }}s"
-                  - type: "mrkdwn"
-                    text: "*Test Latency:*\n${{ env.TEST_LATENCY }}s"
-              - type: "divider"
-              - type: "section"
-                text:
-                  type: "mrkdwn"
-                  text: >
-                    "*${{ env.DEPLOY_SUCCESS == 'true' && '🧩 Deploy Output' || '🧩 ❌ Deploy Output' }}*"\n```${
-                    { env.DEPLOY_STDOUT }}``` ...
-              - type: "section"
-                text:
-                  type: "mrkdwn"
-                  text: >
-                    "*${{ env.TEST_SUCCESS == 'true' && '🧪 Tool Call Output' || '🧪 ❌ Tool Call Output' }}*"\n```${
-                    { env.TEST_STDOUT }}``` ...
-              - type: "divider"
-              - type: "context"
-                elements:
-                  - type: "mrkdwn"
-                    text: "_Triggered by <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|GitHub Actions Canary Job>_"
-      
-      - name: Upload logs to Slack
-        if: always()
-        run: |
-          curl -F file=@full_deploy.log -F "initial_comment=🧩 Deploy log for app $APP_ID" -F channels=${{ secrets.SLACK_CHANNEL_ID }} -H "Authorization: Bearer ${{ secrets.SLACK_BOT_TOKEN }}" https://slack.com/api/files.upload
-          curl -F file=@full_test.log -F "initial_comment=🧪 Test log for app $APP_ID" -F channels=${{ secrets.SLACK_CHANNEL_ID }} -H "Authorization: Bearer ${{ secrets.SLACK_BOT_TOKEN }}" https://slack.com/api/files.upload
+            attachments:
+              - color: "${{ env.STATUS == 'success' && '#36a64f' || env.STATUS == 'failure' && '#9ca3af' || '#e01e5a' }}"
+                blocks:
+                  - type: "header"
+                    text:
+                      type: "plain_text"
+                      text: "${{ env.STATUS == 'success' && '✅ GitHub Actions Canary Passed' || env.STATUS == 'failure' && '🪦 GitHub Actions Canary Failed' || '❌ GitHub Actions Canary Error' }}"
+                  - type: "section"
+                    fields:
+                      - type: "mrkdwn"
+                        text: "*App ID:*\n${{ env.APP_ID }}"
+                      - type: "mrkdwn"
+                        text: "*Total Latency:*\n*${{ env.TOTAL_LATENCY }}s*"
+                      - type: "mrkdwn"
+                        text: "*Deploy Latency:*\n${{ env.DEPLOY_LATENCY }}s"
+                      - type: "mrkdwn"
+                        text: "*Test Latency:*\n${{ env.TEST_LATENCY }}s"
+                  - type: "divider"
+                  - type: "section"
+                    text:
+                      type: "mrkdwn"
+                      text: >
+                        "*${{ env.DEPLOY_SUCCESS == 'true' && '✅ Deploy Output' || '❌ Deploy Output' }}*"\n```${
+                        { env.DEPLOY_STDOUT }}``` ...
+                  - type: "section"
+                    text:
+                      type: "mrkdwn"
+                      text: >
+                        "*${{ env.TEST_SUCCESS == 'true' && '✅ Tool Call Output' || '❌ Tool Call Output' }}*"\n```${
+                        { env.TEST_STDOUT }}``` ...
+                  - type: "divider"
+                  - type: "context"
+                    elements:
+                      - type: "mrkdwn"
+                        text: "_Triggered by <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|GitHub Actions Canary Job>_"
