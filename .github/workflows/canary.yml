@@ -26,14 +26,14 @@ jobs:
       - name: Deploy
         id: deploy
         run: |
-          python canary/deploy_app.py | tee deploy_output.json
+          python canary/deploy_app.py | tee full_deploy.log | tail -n 1 > deploy_output.json
         continue-on-error: false
 
       - name: Test app
         id: test
         run: |
           APP_URL=$(jq -r '.app_url' deploy_output.json)
-          python canary/test_app.py "$APP_URL" | tee test_output.json
+          python canary/test_app.py "$APP_URL" | tee full_test.log | tail -n 1 > test_output.json
 
       - name: Log results
         run: |
@@ -58,5 +58,6 @@ jobs:
       - name: Cleanup
         if: always()
         run: |
-          APP_ID=$(jq -r '.app_id' deploy_output.json)
-          python canary/delete_app.py "$APP_ID"
+          APP_ID=$(jq -r '.app_id // empty' deploy_output.json)
+          if [ -n "$APP_ID" ]; then
+            python canary/delete_app.py "$APP_ID" | tee full_delete.log | tail -n 1 > delete_output.json
