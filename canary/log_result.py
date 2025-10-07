@@ -20,7 +20,7 @@ def log_result(
     """Write a single unified log entry for the full canary run."""
 
     # Normalize/sanitize potentially invalid Unicode sequences, then tail safely
-    def safe_tail(s, n=500):
+    def safe_tail(s, n=200):
         if not isinstance(s, str):
             s = str(s)
         return s.encode("utf-8", "replace").decode("utf-8")[-n:]
