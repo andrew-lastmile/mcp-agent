@@ -42,7 +42,6 @@ jobs:
           APP_URL=$(jq -r '.app_url' deploy_output.json 2>/dev/null || echo "")
           python canary/test_app.py "$APP_URL" | tee full_test.log | tail -n 1 > test_output.json || exit 1
 
-      # ✅ Compute a single, canonical status and don't change it later
       - name: Normalize status
         id: normalize
         if: always()
@@ -51,12 +50,10 @@ jobs:
           TEST_OUTCOME: ${{ steps.test.outcome }}
         run: |
           set -e
-          STATUS="canary-down"  # default
-          # If deploy failed, the canary itself is down
           if [ "$DEPLOY_OUTCOME" != "success" ]; then
-            STATUS="canary-down"
-          else
-            # If tests produced a JSON with .success, trust it
+            STATUS="canary-down"                       # deploy failed → infra issue
+          elif [ "$TEST_OUTCOME" = "success" ]; then
+            # We have a test result; honor it if present, else assume failure
             if jq -e .success test_output.json >/dev/null 2>&1; then
               if [ "$(jq -r '.success' test_output.json)" = "true" ]; then
                 STATUS="success"
@@ -64,9 +61,12 @@ jobs:
                 STATUS="failure"
               fi
             else
-              # No usable test result -> likely can't reach the app
-              STATUS="canary-down"
+              STATUS="failure"                         # test ran but no JSON → still a test failure
             fi
+          elif [ "$TEST_OUTCOME" = "failure" ]; then
+            STATUS="failure"                           # tool call / assertion / timeout
+          else
+            STATUS="canary-down"                       # skipped or unknown
           fi
           echo "STATUS=$STATUS" >> "$GITHUB_ENV"
           echo "::notice title=Normalized status::$STATUS"
