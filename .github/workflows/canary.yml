@@ -77,3 +77,4 @@ jobs:
           APP_ID=$(jq -r '.app_id // empty' deploy_output.json)
           if [ -n "$APP_ID" ]; then
             python canary/delete_app.py "$APP_ID" | tee full_delete.log | tail -n 1 > delete_output.json
+          fi
