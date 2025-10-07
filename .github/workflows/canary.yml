@@ -107,18 +107,17 @@ jobs:
           webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
           webhook-type: incoming-webhook
           payload: |
-            text: "MCP Canary Run — ${{ env.STATUS }}"
             blocks:
               - type: "header"
                 text:
                   type: "plain_text"
-                  text: "${{ env.STATUS == 'success' && '✅ Canary Passed' || env.STATUS == 'failure' && '❌ Canary Failed' || '⚠️ Canary Error' }}"
+                  text: "${{ env.STATUS == 'success' && '✅ GitHub Actions Canary Passed' || env.STATUS == 'failure' && '❌ GitHub Actions Canary Failed' || '⚠️ GitHub Actions Canary Error' }}"
               - type: "section"
                 fields:
                   - type: "mrkdwn"
                     text: "*App ID:*\n${{ env.APP_ID }}"
                   - type: "mrkdwn"
-                    text: "*Total Latency:*\n${{ env.TOTAL_LATENCY }}s"
+                    text: "*Total Latency:*\n*${{ env.TOTAL_LATENCY }}s*"
                   - type: "mrkdwn"
                     text: "*Deploy Latency:*\n${{ env.DEPLOY_LATENCY }}s"
                   - type: "mrkdwn"
@@ -128,12 +127,15 @@ jobs:
                 text:
                   type: "mrkdwn"
                   text: >
-                    *🧩 Deploy Output (truncated)*\n```${{ env.DEPLOY_STDOUT }}```
+                    "*${{ env.DEPLOY_SUCCESS == 'true' && '🧩 Deploy Output' || '🧩 ❌ Deploy Output' }}*"\n```${
+                    { env.DEPLOY_STDOUT }}``` ...
               - type: "section"
                 text:
                   type: "mrkdwn"
                   text: >
-                    *🧪 Test Output (truncated)*\n```${{ env.TEST_STDOUT }}```
+                    "*${{ env.TEST_SUCCESS == 'true' && '🧪 Tool Call Output' || '🧪 ❌ Tool Call Output' }}*"\n```${
+                    { env.TEST_STDOUT }}``` ...
+              - type: "divider"
               - type: "context"
                 elements:
                   - type: "mrkdwn"
