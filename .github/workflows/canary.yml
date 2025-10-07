@@ -85,7 +85,6 @@ jobs:
             python canary/delete_app.py "$APP_ID" | tee full_delete.log | tail -n 1 > delete_output.json
           fi
 
-      # ✅ New Slack Notification Step (with outputs)
       - name: Notify Slack
         if: always()
         uses: slackapi/slack-github-action@v2.1.1
@@ -93,7 +92,7 @@ jobs:
           webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
           webhook-type: incoming-webhook
           payload: |
-            text: "MCP Canary run completed — status: *${{ env.STATUS }}*"
+            text: "MCP Canary run completed — *${{ env.STATUS }}*"
             blocks:
               - type: "section"
                 text:
@@ -107,15 +106,13 @@ jobs:
                     text: "*App ID:*\n${{ env.APP_ID }}"
                   - type: "mrkdwn"
                     text: "*Total Latency:*\n${{ env.TOTAL_LATENCY }}s"
-              - type: "section"
-                text:
-                  type: "mrkdwn"
-                  text: "*Deploy Output (truncated)*\n```${{ env.DEPLOY_STDOUT }}```"
-              - type: "section"
-                text:
-                  type: "mrkdwn"
-                  text: "*Test Output (truncated)*\n```${{ env.TEST_STDOUT }}```"
               - type: "context"
                 elements:
                   - type: "mrkdwn"
                     text: "_Triggered by GitHub Actions Canary Job — <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View logs>_"
+
+      - name: Upload logs to Slack
+        if: always()
+        run: |
+          curl -F file=@full_deploy.log -F "initial_comment=🧩 Deploy log for app $APP_ID" -F channels=${{ secrets.SLACK_CHANNEL_ID }} -H "Authorization: Bearer ${{ secrets.SLACK_BOT_TOKEN }}" https://slack.com/api/files.upload
+          curl -F file=@full_test.log -F "initial_comment=🧪 Test log for app $APP_ID" -F channels=${{ secrets.SLACK_CHANNEL_ID }} -H "Authorization: Bearer ${{ secrets.SLACK_BOT_TOKEN }}" https://slack.com/api/files.upload
