@@ -11,13 +11,10 @@ def log_result(
     total_latency,
     deploy_latency,
     test_latency,
-    delete_latency,
     deploy_stdout,
     deploy_stderr,
     test_stdout,
-    test_stderr,
-    delete_stdout,
-    delete_stderr,
+    test_stderr
 ):
     """Write a single unified log entry for the full canary run."""
     entry = {
@@ -27,13 +24,10 @@ def log_result(
         "total_latency_s": float(total_latency),
         "deploy_latency_s": float(deploy_latency),
         "test_latency_s": float(test_latency),
-        "delete_latency_s": float(delete_latency),
         "deploy_stdout": deploy_stdout[-500:],
         "deploy_stderr": deploy_stderr[-500:],
         "test_stdout": test_stdout[-500:],
         "test_stderr": test_stderr[-500:],
-        "delete_stdout": delete_stdout[-500:],
-        "delete_stderr": delete_stderr[-500:],
     }
 
     with open(LOG_FILE, "a", encoding="utf-8") as f:
@@ -46,10 +40,10 @@ def log_result(
 
 if __name__ == "__main__":
     # Expect 12 arguments (besides script name)
-    if len(sys.argv) < 13:
+    if len(sys.argv) < 9:
         print(
-            "Usage: log_result.py <status> <app_id> <total_latency> <deploy_latency> <test_latency> <delete_latency> "
-            "<deploy_stdout> <deploy_stderr> <test_stdout> <test_stderr> <delete_stdout> <delete_stderr>"
+            "Usage: log_result.py <status> <app_id> <total_latency> <deploy_latency> <test_latency> "
+            "<deploy_stdout> <deploy_stderr> <test_stdout> <test_stderr> "
         )
         sys.exit(1)
 
