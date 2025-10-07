@@ -19,11 +19,10 @@ def log_result(
 ):
     """Write a single unified log entry for the full canary run."""
 
-    # Normalize / sanitize potentially invalid Unicode sequences
+    # Normalize/sanitize potentially invalid Unicode sequences, then tail safely
     def safe_tail(s, n=500):
         if not isinstance(s, str):
             s = str(s)
-        # Replace invalid surrogates safely
         return s.encode("utf-8", "replace").decode("utf-8")[-n:]
 
     entry = {
@@ -39,14 +38,11 @@ def log_result(
         "test_stderr": safe_tail(test_stderr),
     }
 
-    # Ensure directory exists (in case script runs elsewhere)
     os.makedirs(os.path.dirname(LOG_FILE) or ".", exist_ok=True)
 
-    # ✅ Write safely even if invalid bytes exist
     with open(LOG_FILE, "a", encoding="utf-8") as f:
-        f.write(json.dumps(entry, ensure_ascii=False, errors="replace") + "\n")
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
-    # Print summary to GitHub Actions log
     print("📊 Canary result logged:")
     print(json.dumps(entry, indent=2, ensure_ascii=False))
 
@@ -59,5 +55,5 @@ if __name__ == "__main__":
         )
         sys.exit(1)
 
-    # Support both full arg set and truncated form
+    # Accept the 9 args provided by your workflow (status..test_stderr)
     log_result(*sys.argv[1:10])
