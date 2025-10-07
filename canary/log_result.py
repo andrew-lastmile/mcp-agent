@@ -20,15 +20,19 @@ def log_result(
     """Write a single unified log entry for the full canary run."""
 
     # Normalize/sanitize potentially invalid Unicode sequences, then tail safely
-    def safe_tail(s, n=3):
-        """Return the last n lines of text."""
+    def safe_tail(s, max_chars=150):
+        """Return a single-line summary."""
         if not isinstance(s, str):
             s = str(s)
-        # Normalize Unicode
         s = s.encode("utf-8", "replace").decode("utf-8")
-        # Split into lines and take last n
-        lines = s.splitlines()
-        return "\n".join(lines[-n:])
+        
+        # Replace newlines with spaces, collapse whitespace
+        s = " ".join(s.split())
+        
+        if len(s) <= max_chars:
+            return s
+        
+        return s[-max_chars:] + "..."
 
     entry = {
         "time": datetime.datetime.utcnow().isoformat() + "Z",
