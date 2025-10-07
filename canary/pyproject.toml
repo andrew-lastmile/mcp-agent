@@ -1,0 +1,14 @@
+[project]
+name = "canary"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastmcp>=2.12.4",
+    "flask>=3.1.2",
+    "mcp-agent>=0.1.27",
+]
+
+[tool.uv.workspace]
+members = ["basic-agent"]
