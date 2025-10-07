@@ -21,6 +21,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install uv
+          uv pip install -e .
           uv version
 
       - name: Deploy
