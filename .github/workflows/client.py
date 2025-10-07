@@ -7,6 +7,7 @@ import asyncio
 import json
 from fastmcp import Client
 
+TIMEOUT=300
 mcpac_api_key = os.environ.get("MCPAC_API_KEY")
 
 async def main():
@@ -80,7 +81,7 @@ async def main():
             if "example_usage" in tool_names:
                 print("\n🔧 Calling example_usage tool...")
                 try:
-                    result = await client.call_tool("example_usage", {})
+                    result = await client.call_tool("example_usage", {}, timeout=TIMEOUT)
                     
                     print(f"📤 Response received")
                     
@@ -117,7 +118,7 @@ async def main():
                         if tool_obj and hasattr(tool_obj, 'inputSchema'):
                             print(f"📋 Tool input schema: {tool_obj.inputSchema}")
                         
-                        result = await client.call_tool(first_tool, {})
+                        result = await client.call_tool(first_tool, {}, timeout=TIMEOUT)
                         print(f"📤 Response: {str(result)[:500]}...")
                         print("✅ Tool call completed!")
                         return 0
