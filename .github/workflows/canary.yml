@@ -82,8 +82,8 @@ jobs:
           TEST_LATENCY=$( [ -f test_output.json ] && jq -r '.latency_s // 0' test_output.json || echo 0 )
           TOTAL_LATENCY=$(echo "$DEPLOY_LATENCY + $TEST_LATENCY" | bc)
 
-          DEPLOY_STDOUT=$( [ -f deploy_output.json ] && jq -r '.output // ""' deploy_output.json | tail -c 150 || echo "" )
-          TEST_STDOUT=$( [ -f test_output.json ] && jq -r '.stdout // ""' test_output.json | tail -c 150 || echo "" )
+          DEPLOY_STDOUT=$( [ -f deploy_output.json ] && jq -r '.output // ""' deploy_output.json | tail -c 500 || echo "" )
+          TEST_STDOUT=$( [ -f test_output.json ] && jq -r '.stdout // ""' test_output.json | tail -c 500 || echo "" )
 
           DEPLOY_SUCCESS=$( [ -f deploy_output.json ] && jq -r '.success // false' deploy_output.json || echo false )
           TEST_SUCCESS=$( [ -f test_output.json ] && jq -r '.success // false' test_output.json || echo false )
@@ -138,6 +138,7 @@ jobs:
           webhook-type: incoming-webhook
           payload: |
             {
+              "text": "Canary Status: ${{ env.STATUS }}",
               "attachments": [
                 {
                   "color": "${{ env.STATUS == 'success' && '#36a64f' || env.STATUS == 'failure' && '#e01e5a' || '#f2c744' }}",
@@ -152,11 +153,21 @@ jobs:
                       "type": "context",
                       "elements": [
                         { "type": "mrkdwn", "text": "*Status:* `${{ env.STATUS }}`" },
-                        { "type": "mrkdwn", "text": "*Total:* `${{ env.TOTAL_LATENCY }}s`" },
-                        { "type": "mrkdwn", "text": "*Deploy:* `${{ env.DEPLOY_LATENCY }}s`" },
-                        { "type": "mrkdwn", "text": "*Test:* `${{ env.TEST_LATENCY }}s`" }
+                        { "type": "mrkdwn", "text": "*Deploy App:* `${{ env.DEPLOY_SUCCESS == 'true' && '✅' || '❌' }}`" },
+                        { "type": "mrkdwn", "text": "*Tool Calls:* `${{ env.TEST_SUCCESS == 'true' && '✅' || '❌' }}`" }
                       ]
                     },
+                    {
+                      "type": "context",
+                      "elements": [
+                        { "type": "mrkdwn", "text": "*Total:* `${{ env.TOTAL_LATENCY }}s`" },
+                        { "type": "mrkdwn", "text": "*Deploy App:* `${{ env.DEPLOY_LATENCY }}s`" },
+                        { "type": "mrkdwn", "text": "*Tool Calls:* `${{ env.TEST_LATENCY }}s`" }
+                      ]
+                    },
+
+                    { "type": "divider" },
+                    
                     {
                       "type": "context",
                       "elements": [
