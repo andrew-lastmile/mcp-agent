@@ -42,6 +42,7 @@ jobs:
           python canary/test_app.py "$APP_URL" | tee full_test.log | tail -n 1 > test_output.json
 
       - name: Log results
+        id: log
         run: |
           APP_ID=$(jq -r '.app_id // empty' deploy_output.json)
           STATUS=$(jq -r '.success // "unknown"' test_output.json)
@@ -53,13 +54,11 @@ jobs:
           TEST_STDOUT=$(jq -r '.stdout // ""' test_output.json)
           TEST_STDERR=$(jq -r '.stderr // ""' test_output.json)
 
-          # Log summary to console
           echo "📊 Logging results for app_id=$APP_ID (status=$STATUS)"
           echo "  Deploy latency: ${DEPLOY_LATENCY}s"
           echo "  Test latency:   ${TEST_LATENCY}s"
           echo "  Total latency:  ${TOTAL_LATENCY}s"
-      
-          # Run the logger
+
           python canary/log_result.py \
             "$STATUS" \
             "$APP_ID" \
@@ -71,6 +70,13 @@ jobs:
             "$TEST_STDOUT" \
             "$TEST_STDERR"
 
+          # Export for Slack
+          echo "STATUS=$STATUS" >> $GITHUB_ENV
+          echo "APP_ID=$APP_ID" >> $GITHUB_ENV
+          echo "TOTAL_LATENCY=$TOTAL_LATENCY" >> $GITHUB_ENV
+          echo "DEPLOY_STDOUT=$(echo "$DEPLOY_STDOUT" | tail -c 500 | jq -Rs .)" >> $GITHUB_ENV
+          echo "TEST_STDOUT=$(echo "$TEST_STDOUT" | tail -c 500 | jq -Rs .)" >> $GITHUB_ENV
+
       - name: Cleanup
         if: always()
         run: |
@@ -78,3 +84,38 @@ jobs:
           if [ -n "$APP_ID" ]; then
             python canary/delete_app.py "$APP_ID" | tee full_delete.log | tail -n 1 > delete_output.json
           fi
+
+      # ✅ New Slack Notification Step (with outputs)
+      - name: Notify Slack
+        if: always()
+        uses: slackapi/slack-github-action@v2.1.1
+        with:
+          webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
+          webhook-type: incoming-webhook
+          payload: |
+            text: "MCP Canary run completed — status: *${{ env.STATUS }}*"
+            blocks:
+              - type: "section"
+                text:
+                  type: "mrkdwn"
+                  text: "*MCP Canary Run Results*"
+              - type: "section"
+                fields:
+                  - type: "mrkdwn"
+                    text: "*Status:*\n${{ env.STATUS }}"
+                  - type: "mrkdwn"
+                    text: "*App ID:*\n${{ env.APP_ID }}"
+                  - type: "mrkdwn"
+                    text: "*Total Latency:*\n${{ env.TOTAL_LATENCY }}s"
+              - type: "section"
+                text:
+                  type: "mrkdwn"
+                  text: "*Deploy Output (truncated)*\n```${{ env.DEPLOY_STDOUT }}```"
+              - type: "section"
+                text:
+                  type: "mrkdwn"
+                  text: "*Test Output (truncated)*\n```${{ env.TEST_STDOUT }}```"
+              - type: "context"
+                elements:
+                  - type: "mrkdwn"
+                    text: "_Triggered by GitHub Actions Canary Job — <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View logs>_"
