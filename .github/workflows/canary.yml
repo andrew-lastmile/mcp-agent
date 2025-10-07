@@ -37,23 +37,33 @@ jobs:
 
       - name: Log results
         run: |
-          APP_ID=$(jq -r '.app_id' deploy_output.json)
-          STATUS=$(jq -r '.success' test_output.json)
-          TOTAL_LATENCY=$(jq -r '.latency_s' test_output.json)
-
-          DEPLOY_LATENCY=$(jq -r '.latency_s' deploy_output.json)
-          TEST_LATENCY=$(jq -r '.latency_s' test_output.json)
-
-          DEPLOY_STDOUT=$(jq -r '.output' deploy_output.json)
+          APP_ID=$(jq -r '.app_id // empty' deploy_output.json)
+          STATUS=$(jq -r '.success // "unknown"' test_output.json)
+          DEPLOY_LATENCY=$(jq -r '.latency_s // 0' deploy_output.json)
+          TEST_LATENCY=$(jq -r '.latency_s // 0' test_output.json)
+          TOTAL_LATENCY=$(echo "$DEPLOY_LATENCY + $TEST_LATENCY" | bc)
+          DEPLOY_STDOUT=$(jq -r '.output // ""' deploy_output.json)
           DEPLOY_STDERR=$(jq -r '.stderr // ""' deploy_output.json)
-          TEST_STDOUT=$(jq -r '.stdout' test_output.json)
-          TEST_STDERR=$(jq -r '.stderr' test_output.json)
+          TEST_STDOUT=$(jq -r '.stdout // ""' test_output.json)
+          TEST_STDERR=$(jq -r '.stderr // ""' test_output.json)
 
+          # Log summary to console
+          echo "📊 Logging results for app_id=$APP_ID (status=$STATUS)"
+          echo "  Deploy latency: ${DEPLOY_LATENCY}s"
+          echo "  Test latency:   ${TEST_LATENCY}s"
+          echo "  Total latency:  ${TOTAL_LATENCY}s"
+      
+          # Run the logger
           python canary/log_result.py \
-            "$STATUS" "$APP_ID" "$TOTAL_LATENCY" \
-            "$DEPLOY_LATENCY" "$TEST_LATENCY" \
-            "$DEPLOY_STDOUT" "$DEPLOY_STDERR" \
-            "$TEST_STDOUT" "$TEST_STDERR"
+            "$STATUS" \
+            "$APP_ID" \
+            "$TOTAL_LATENCY" \
+            "$DEPLOY_LATENCY" \
+            "$TEST_LATENCY" \
+            "$DEPLOY_STDOUT" \
+            "$DEPLOY_STDERR" \
+            "$TEST_STDOUT" \
+            "$TEST_STDERR"
 
       - name: Cleanup
         if: always()
