@@ -31,21 +31,35 @@ def call_mcp_client(app_url):
     try:
         # Run the client.py script in its own directory
         process = subprocess.Popen(
-            ["python", client_path],
+            [sys.executable, "-u", client_path, app_url],   # <-- unbuffered, pass URL too
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
-            env=env,
-            cwd=script_dir,  # ensures relative imports/configs still work
+            env={**env, "PYTHONUNBUFFERED": "1"},
+            cwd=script_dir,
             bufsize=1,
         )
-
+        
         output = ""
-        for line in process.stdout:
-            print(line, end="")  # stream output live to console
-            output += line
+        last = time.time()
+        idle_timeout = 30      # seconds without new output
+        hard_timeout = 600     # max runtime
 
-        process.wait()
+        while True:
+            line = process.stdout.readline()
+            now = time.time()
+            if line:
+                print(line, end="")
+                output += line
+                last = now
+            elif process.poll() is not None:
+                break
+            elif now - last > idle_timeout or now - start > hard_timeout:
+                process.kill()
+                print("⏱️ Killing stuck client.py (timeout).")
+                break
+        
+        process.wait(timeout=5)
         latency = round(time.time() - start, 3)
         success = process.returncode == 0
 
