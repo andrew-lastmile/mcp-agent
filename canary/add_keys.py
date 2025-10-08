@@ -107,9 +107,9 @@ def main():
     # Only write if changed
     if updated != original:
         atomic_write(args.file, updated)
-        print("[inject_openai_key] Injection complete.")
+        print("[add_openai_key] Injection complete.")
     else:
-        print("[inject_openai_key] No changes needed.")
+        print("[add_openai_key] No changes needed.")
 
 if __name__ == "__main__":
     main()
