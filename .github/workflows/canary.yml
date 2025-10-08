@@ -50,31 +50,43 @@ jobs:
         id: normalize
         if: always()
         env:
-          DEPLOY_OUTCOME: ${{ steps.deploy.outcome }}
-          TEST_OUTCOME: ${{ steps.test.outcome }}
+          DEPLOY_OUTCOME: ${{ steps.deploy.outcome }}   # success | failure | cancelled | skipped
+          TEST_OUTCOME: ${{ steps.test.outcome }}       # success | failure | cancelled | skipped
         run: |
           set -e
-          if [ "$DEPLOY_OUTCOME" != "success" ]; then
-            STATUS="canary-down"                       # deploy failed → infra issue
-          elif [ "$TEST_OUTCOME" = "success" ]; then
-            # We have a test result; honor it if present, else assume failure
-            if jq -e .success test_output.json >/dev/null 2>&1; then
-              if [ "$(jq -r '.success' test_output.json)" = "true" ]; then
-                STATUS="success"
-              else
+      
+          case "$DEPLOY_OUTCOME" in
+            failure)
+              # Deploy step ran and failed → this is a canary FAILURE (red)
+              STATUS="failure"
+              ;;
+            cancelled|skipped|"")
+              # Workflow/tooling prevented deploy from running → CANARY DOWN (yellow)
+              STATUS="canary-down"
+              ;;
+            success)
+              # Deploy succeeded → evaluate tests
+              if [ "$TEST_OUTCOME" = "failure" ]; then
                 STATUS="failure"
+              elif [ "$TEST_OUTCOME" = "cancelled" ] || [ "$TEST_OUTCOME" = "skipped" ] || [ -z "$TEST_OUTCOME" ]; then
+                STATUS="canary-down"
+              else
+                # TEST_OUTCOME == success: trust JSON if present; otherwise treat as failure
+                if jq -e .success test_output.json >/dev/null 2>&1 && [ "$(jq -r '.success' test_output.json)" = "true" ]; then
+                  STATUS="success"
+                else
+                  STATUS="failure"
+                fi
               fi
-            else
-              STATUS="failure"                         # test ran but no JSON → still a test failure
-            fi
-          elif [ "$TEST_OUTCOME" = "failure" ]; then
-            STATUS="failure"                           # tool call / assertion / timeout
-          else
-            STATUS="canary-down"                       # skipped or unknown
-          fi
+              ;;
+            *)
+              STATUS="canary-down"
+              ;;
+          esac
+      
           echo "STATUS=$STATUS" >> "$GITHUB_ENV"
           echo "::notice title=Normalized status::$STATUS"
-
+          
       - name: Log results
         id: log
         if: always()
