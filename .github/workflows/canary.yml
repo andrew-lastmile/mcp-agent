@@ -28,6 +28,10 @@ jobs:
           uv pip install rich --system
           uv version
 
+      - name: Add keys
+        run: |
+          python canary/add_keys.py --file canary/basic-agent/mcp_agent.secrets.yaml
+
       - name: Deploy
         id: deploy
         run: |
