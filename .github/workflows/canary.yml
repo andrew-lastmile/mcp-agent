@@ -99,7 +99,7 @@ jobs:
           TOTAL_LATENCY=$(echo "$DEPLOY_LATENCY + $TEST_LATENCY" | bc)
 
           DEPLOY_STDOUT=$( [ -f deploy_output.json ] && jq -r '.output // ""' deploy_output.json | tail -c 500 || echo "" )
-          TEST_STDOUT=$( [ -f full_test.log ] && tail -c 5000 full_test.log || echo "" )
+          TEST_STDOUT=$( [ -f full_test.log ] && tail -c 1000 full_test.log || echo "" )
 
           DEPLOY_SUCCESS=$( [ -f deploy_output.json ] && jq -r '.success // false' deploy_output.json || echo false )
           TEST_SUCCESS=$( [ -f test_output.json ] && jq -r '.success // false' test_output.json || echo false )
