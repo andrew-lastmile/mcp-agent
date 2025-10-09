@@ -6,6 +6,7 @@ import sys
 import asyncio
 import json
 from fastmcp import Client
+from asyncio import TimeoutError, wait_for
 
 TIMEOUT=300
 mcpac_api_key = os.environ.get("MCPAC_API_KEY")
@@ -81,7 +82,12 @@ async def main():
             if "example_usage" in tool_names:
                 print("\n🔧 Calling example_usage tool...")
                 try:
-                    result = await client.call_tool("example_usage", {}, timeout=TIMEOUT)
+                    
+                    try:
+                        result = await wait_for(client.call_tool("example_usage", {}), timeout=TIMEOUT)
+                    except TimeoutError:
+                        print(f"⏱️ Tool call exceeded timeout of {TIMEOUT} seconds")
+                        return 1
                     
                     print(f"📤 Response received")
                     
