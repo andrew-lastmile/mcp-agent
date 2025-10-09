@@ -6,7 +6,7 @@ import sys
 import time
 import os
 
-api_key = os.environ.get("OPENAI_API_KEY")
+api_key = os.environ.get("MCPAC_API_KEY")
 
 def deploy_app():
     print("🚀 Starting deployment...")
