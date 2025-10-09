@@ -15,7 +15,7 @@ def deploy_app():
     start = time.time()
 
     process = subprocess.Popen(
-        ["uv", "run", "mcp-agent", "deploy", "basic-agent", "--api-key", api_key],
+        ["uv", "run", "mcp-agent", "deploy", "woodstock-canary", "--api-key", api_key],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         stdin=subprocess.PIPE,
