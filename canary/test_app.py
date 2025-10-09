@@ -66,7 +66,7 @@ def call_mcp_client(app_url):
         result = {
             "success": success,
             "latency_s": latency,
-            "stdout": output[-3000:],  # last 3000 chars for debugging
+            "stdout": output[-1000:],  # last 1000 chars
             "stderr": "",
         }
 
