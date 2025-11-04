@@ -12,6 +12,7 @@ from rich.console import Console
 from rich.table import Table
 from rich.prompt import Confirm
 
+from mcp_agent.cli.utils.ux import LOG_VERBOSE
 from mcp_agent.config import Settings, MCPServerSettings, MCPSettings, get_settings
 from mcp_agent.cli.utils.importers import import_servers_from_mcp_json
 from mcp_agent.core.context import cleanup_context
@@ -304,6 +305,8 @@ def _persist_server_entry(name: str, settings: MCPServerSettings) -> None:
             entry["args"] = settings.args
         if settings.env:
             entry["env"] = settings.env
+        if settings.cwd:
+            entry["cwd"] = settings.cwd
     else:
         if settings.url:
             entry["url"] = settings.url
@@ -431,6 +434,9 @@ def add(
     env: Optional[str] = typer.Option(
         None, "--env", "-e", help="Environment variables (KEY=value,...)"
     ),
+    cwd: Optional[str] = typer.Option(
+        None, "--cwd", help="Working directory for stdio server process"
+    ),
     write: bool = typer.Option(
         True, "--write/--no-write", help="Persist to config file"
     ),
@@ -505,6 +511,7 @@ def add(
         entry.command = recipe.get("command")
         entry.args = recipe.get("args", [])
         entry.env = {**recipe.get("env", {}), **env_dict}
+        entry.cwd = recipe.get("cwd")
 
         srv_name = name or value
 
@@ -619,6 +626,7 @@ def add(
         entry.command = parts[0]
         entry.args = parts[1:] if len(parts) > 1 else []
         entry.env = env_dict
+        entry.cwd = cwd
         srv_name = name or parts[0].split("/")[-1]
 
     # Check if server already exists
@@ -686,6 +694,10 @@ def test(
     import asyncio
     from mcp_agent.app import MCPApp
     from mcp_agent.agents.agent import Agent
+
+    if verbose:
+        LOG_VERBOSE.set(True)
+    verbose = LOG_VERBOSE.get()
 
     async def _probe():
         app_obj = MCPApp(name="server-test")
@@ -853,6 +865,7 @@ def import_claude(
                             entry.command = server_config.get("command", "")
                             entry.args = server_config.get("args", [])
                             entry.env = server_config.get("env", {})
+                            entry.cwd = server_config.get("cwd")
                             _persist_server_entry(name, entry)
                         console.print(
                             f"\n[green]✅ Imported {len(servers)} servers[/green]"

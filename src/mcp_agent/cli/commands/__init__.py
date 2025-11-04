@@ -11,7 +11,6 @@ from . import (
     invoke,
     serve,
     init,
-    quickstart,
     config,
     keys,
     models,
@@ -22,6 +21,7 @@ from . import (
     configure,
     go,
     check,
+    install,
 )  # noqa: F401
 
 __all__ = [
@@ -30,7 +30,6 @@ __all__ = [
     "invoke",
     "serve",
     "init",
-    "quickstart",
     "config",
     "keys",
     "models",
@@ -41,4 +40,5 @@ __all__ = [
     "configure",
     "go",
     "check",
+    "install",
 ]

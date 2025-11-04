@@ -19,12 +19,8 @@ from anyio.abc import TaskGroup
 from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
 
 from mcp import ClientSession
-from mcp.client.stdio import (
-    StdioServerParameters,
-    get_default_environment,
-)
+from mcp.client.stdio import StdioServerParameters, get_default_environment
 from mcp.client.sse import sse_client
-from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import streamablehttp_client, MCP_SESSION_ID
 from mcp.client.websocket import websocket_client
 from mcp.types import JSONRPCMessage, ServerCapabilities
@@ -35,12 +31,24 @@ from mcp_agent.core.exceptions import ServerInitializationError
 from mcp_agent.logging.event_progress import ProgressAction
 from mcp_agent.logging.logger import get_logger
 from mcp_agent.mcp.mcp_agent_client_session import MCPAgentClientSession
+from mcp_agent.mcp.stdio_transport import filtered_stdio_client
+from mcp_agent.oauth.http import OAuthHttpxAuth
 
 if TYPE_CHECKING:
     from mcp_agent.mcp.mcp_server_registry import InitHookCallable, ServerRegistry
     from mcp_agent.core.context import Context
 
 logger = get_logger(__name__)
+
+
+def _resolve_identity_from_context():
+    try:
+        from mcp_agent.server import app_server  # type: ignore
+
+        identity = app_server.get_current_identity()
+        return identity
+    except Exception:
+        return None
 
 
 class ServerConnection:
@@ -442,9 +450,12 @@ class MCPConnectionManager(ContextDependent):
                     command=config.command,
                     args=config.args or [],
                     env={**get_default_environment(), **(config.env or {})},
+                    cwd=config.cwd or None,
                 )
-                # Create stdio client config with redirected stderr
-                return stdio_client(server=server_params)
+                # Create stdio client config with filtered stdout
+                return filtered_stdio_client(
+                    server_name=server_name, server=server_params
+                )
             elif config.transport in ["streamable_http", "streamable-http", "http"]:
                 if session_id:
                     headers = config.headers.copy() if config.headers else {}
@@ -475,6 +486,31 @@ class MCPConnectionManager(ContextDependent):
 
                 if sse_read_timeout is not None:
                     kwargs["sse_read_timeout"] = sse_read_timeout
+
+                auth_handler = None
+                oauth_cfg = config.auth.oauth if config.auth else None
+                ctx = None
+                try:
+                    ctx = self.context
+                except Exception:
+                    ctx = None
+                if oauth_cfg and oauth_cfg.enabled:
+                    token_manager = getattr(ctx, "token_manager", None) if ctx else None
+                    if token_manager is None:
+                        logger.warning(
+                            f"{server_name}: OAuth configured but token manager not available; skipping auth"
+                        )
+                    else:
+                        auth_handler = OAuthHttpxAuth(
+                            token_manager=token_manager,
+                            context=ctx,
+                            server_name=server_name,
+                            server_config=config,
+                            scopes=oauth_cfg.scopes,
+                            identity_resolver=_resolve_identity_from_context,
+                        )
+                if auth_handler:
+                    kwargs["auth"] = auth_handler
 
                 return streamablehttp_client(
                     **kwargs,

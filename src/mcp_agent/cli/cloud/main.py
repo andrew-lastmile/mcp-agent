@@ -16,6 +16,7 @@ from mcp_agent.cli.cloud.commands import (
     logout,
     whoami,
 )
+from mcp_agent.cli.cloud.commands.apps import update_app as update_app_command
 from mcp_agent.cli.cloud.commands.app import (
     delete_app,
     get_app_status,
@@ -88,6 +89,7 @@ app_cmd_app.command(name="list")(list_servers)
 app_cmd_app.command(name="delete")(delete_app)
 app_cmd_app.command(name="status")(get_app_status)
 app_cmd_app.command(name="workflows")(list_app_workflows)
+app_cmd_app.command(name="update")(update_app_command)
 app.add_typer(app_cmd_app, name="apps", help="Manage an MCP App")
 
 # Sub-typer for `mcp-agent workflows` commands
@@ -175,11 +177,6 @@ def callback(
     ),
 ) -> None:
     """MCP Agent Cloud CLI."""
-    # Best-effort version check (5s timeout, non-fatal). Guard to run once.
-    try:
-        maybe_warn_newer_version()
-    except Exception:
-        pass
     if version:
         v = metadata_version("mcp-agent")
         typer.echo(f"MCP Agent Cloud CLI version: {v}")

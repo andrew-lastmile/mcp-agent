@@ -3,21 +3,36 @@ MCPAgentServer - Exposes MCPApp as MCP server, and
 mcp-agent workflows and agents as MCP tools.
 """
 
+from __future__ import annotations
+
 import json
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
-from typing import Any, Dict, List, Optional, Set, Tuple, Type, TYPE_CHECKING
+import time
+import httpx
 import os
 import secrets
 import asyncio
 
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from typing import Any, Dict, List, Optional, Set, Tuple, Type
+from pydantic import BaseModel, Field
+from contextvars import ContextVar, Token
+from urllib.parse import parse_qs, urlparse
+from json import JSONDecodeError
+
 from mcp.server.fastmcp import Context as MCPContext, FastMCP
-from starlette.requests import Request
-from starlette.responses import JSONResponse
+from mcp.server.fastmcp.server import AuthSettings
+from mcp.server.auth.middleware.auth_context import (
+    AuthenticatedUser,
+    auth_context_var,
+)
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.server.fastmcp.tools import Tool as FastTool
 
-from mcp_agent.app import MCPApp
+from starlette.requests import Request
+from starlette.responses import HTMLResponse, JSONResponse
+
+from mcp_agent.app import MCPApp, phetch
 from mcp_agent.agents.agent import Agent
 from mcp_agent.core.context_dependent import ContextDependent
 from mcp_agent.executor.workflow import Workflow
@@ -26,30 +41,80 @@ from mcp_agent.executor.workflow_registry import (
     WorkflowRegistry,
     WorkflowRunsPage,
 )
-
 from mcp_agent.logging.logger import get_logger
 from mcp_agent.logging.logger import LoggingConfig
+from mcp_agent.core.context import Context
+from mcp_agent.core.request_context import (
+    get_current_request_context,
+    reset_current_request_context,
+    set_current_request_context,
+)
 from mcp_agent.mcp.mcp_server_registry import ServerRegistry
-
-if TYPE_CHECKING:
-    from mcp_agent.core.context import Context
+from mcp_agent.oauth.identity import (
+    OAuthUserIdentity,
+    DEFAULT_PRECONFIGURED_IDENTITY,
+    session_identity as _session_identity_from_value,
+)
+from mcp_agent.oauth.callbacks import callback_registry
+from mcp_agent.server.token_verifier import MCPAgentTokenVerifier
+from mcp_agent.oauth.errors import (
+    AuthorizationDeclined,
+    CallbackTimeoutError,
+    OAuthFlowError,
+)
+from mcp_agent.oauth.records import TokenRecord
 
 logger = get_logger(__name__)
 # Simple in-memory registry mapping workflow execution_id -> upstream session handle.
 # Allows external workers (e.g., Temporal) to relay logs/prompts through MCPApp.
 _RUN_SESSION_REGISTRY: Dict[str, Any] = {}
 _RUN_EXECUTION_ID_REGISTRY: Dict[str, str] = {}
+_RUN_IDENTITY_REGISTRY: Dict[str, OAuthUserIdentity] = {}
+_RUN_LOGGING_SESSION: Dict[str, str] = {}
+_RUN_CONTEXT_REGISTRY: Dict[str, Context] = {}
 _RUN_SESSION_LOCK = asyncio.Lock()
 _PENDING_PROMPTS: Dict[str, Dict[str, Any]] = {}
 _PENDING_PROMPTS_LOCK = asyncio.Lock()
 _IDEMPOTENCY_KEYS_SEEN: Dict[str, Set[str]] = {}
 _IDEMPOTENCY_KEYS_LOCK = asyncio.Lock()
 
+_CURRENT_IDENTITY: ContextVar[OAuthUserIdentity | None] = ContextVar(
+    "mcp_current_identity", default=None
+)
 
-async def _register_session(run_id: str, execution_id: str, session: Any) -> None:
+
+def _clear_cached_session_refs(target: Any, session: Any | None) -> None:
+    if target is None or session is None:
+        return
+    try:
+        if getattr(target, "_last_known_upstream_session", None) is session:
+            setattr(target, "_last_known_upstream_session", None)
+    except Exception:
+        pass
+
+
+async def _register_session(
+    run_id: str,
+    execution_id: str,
+    session: Any,
+    identity: OAuthUserIdentity | None = None,
+    context: "Context" | None = None,
+    session_id: str | None = None,
+) -> None:
     async with _RUN_SESSION_LOCK:
         _RUN_SESSION_REGISTRY[execution_id] = session
         _RUN_EXECUTION_ID_REGISTRY[run_id] = execution_id
+        if identity is not None:
+            _RUN_IDENTITY_REGISTRY[execution_id] = identity
+        if context is not None:
+            _RUN_CONTEXT_REGISTRY[execution_id] = context
+        resolved_session_id = (
+            session_id
+            or getattr(context, "request_session_id", None)
+            or getattr(identity, "subject", None)
+        )
+        if resolved_session_id:
+            _RUN_LOGGING_SESSION[execution_id] = resolved_session_id
         try:
             logger.debug(
                 f"Registered upstream session for run_id={run_id}, execution_id={execution_id}, session_id={id(session)}"
@@ -62,7 +127,15 @@ async def _unregister_session(run_id: str) -> None:
     async with _RUN_SESSION_LOCK:
         execution_id = _RUN_EXECUTION_ID_REGISTRY.pop(run_id, None)
         if execution_id:
-            _RUN_SESSION_REGISTRY.pop(execution_id, None)
+            session = _RUN_SESSION_REGISTRY.pop(execution_id, None)
+            _RUN_IDENTITY_REGISTRY.pop(execution_id, None)
+            context_ref = _RUN_CONTEXT_REGISTRY.pop(execution_id, None)
+            _RUN_LOGGING_SESSION.pop(execution_id, None)
+            if context_ref is not None:
+                app_ref = getattr(context_ref, "app", None)
+                _clear_cached_session_refs(context_ref, session)
+                if app_ref is not None:
+                    _clear_cached_session_refs(app_ref, session)
             try:
                 logger.debug(
                     f"Unregistered upstream session mapping for run_id={run_id}, execution_id={execution_id}"
@@ -84,6 +157,78 @@ async def _get_session(execution_id: str) -> Any | None:
         except Exception:
             pass
         return session
+
+
+def _get_identity_for_execution(execution_id: str) -> OAuthUserIdentity | None:
+    return _RUN_IDENTITY_REGISTRY.get(execution_id)
+
+
+def _get_context_for_execution(execution_id: str) -> "Context" | None:
+    return _RUN_CONTEXT_REGISTRY.get(execution_id)
+
+
+def _set_current_identity(identity: OAuthUserIdentity | None) -> None:
+    _CURRENT_IDENTITY.set(identity)
+
+
+def get_current_identity() -> OAuthUserIdentity | None:
+    return _CURRENT_IDENTITY.get()
+
+
+def _resolve_identity_for_request(
+    ctx: MCPContext | None = None,
+    app_context: "Context" | None = None,
+    execution_id: str | None = None,
+) -> OAuthUserIdentity:
+    identity = _CURRENT_IDENTITY.get()
+    if identity is None and execution_id:
+        identity = _get_identity_for_execution(execution_id)
+    request_session_id: str | None = None
+    if ctx is not None:
+        request_session_id = _extract_session_id_from_context(ctx)
+    if app_context is None and ctx is not None:
+        app = _get_attached_app(ctx.fastmcp)
+        if app is not None and getattr(app, "context", None) is not None:
+            app_context = app.context
+    if identity is None and request_session_id:
+        resolved = get_identity_for_session(request_session_id, app_context)
+        if resolved:
+            logger.debug(
+                "Resolved identity from session registry",
+                data={
+                    "session_id": request_session_id,
+                    "identity": resolved.cache_key,
+                },
+            )
+            identity = resolved
+    if identity is None and app_context is not None:
+        session_id = getattr(app_context, "session_id", None)
+        if session_id and session_id != request_session_id:
+            identity = get_identity_for_session(session_id, app_context)
+    if identity is None:
+        identity = DEFAULT_PRECONFIGURED_IDENTITY
+    return identity
+
+
+def get_identity_for_session(
+    session_id: str | None, app_context: "Context" | None = None
+) -> OAuthUserIdentity | None:
+    """Lookup the cached identity for a given MCP session."""
+    if not session_id:
+        return None
+    if app_context is not None:
+        try:
+            identity = app_context.identity_registry.get(session_id)
+            if identity is not None:
+                return identity
+        except Exception:
+            pass
+    else:
+        logger.debug(
+            "No app context provided when resolving session identity",
+            data={"session_id": session_id},
+        )
+    return _session_identity_from_value(session_id)
 
 
 class ServerContext(ContextDependent):
@@ -162,68 +307,252 @@ def _get_attached_server_context(mcp: FastMCP) -> ServerContext | None:
     return getattr(mcp, "_mcp_agent_server_context", None)
 
 
-def _set_upstream_from_request_ctx_if_available(ctx: MCPContext) -> None:
-    """Attach the low-level server session to the app context for upstream log forwarding.
+def _enter_request_context(
+    ctx: MCPContext | None,
+) -> Tuple[Optional["Context"], Token | None]:
+    """Prepare and bind a per-request context, returning it alongside the contextvar token."""
+    if ctx is None:
+        return None, None
 
-    This ensures logs emitted from background workflow tasks are forwarded to the client
-    even when the low-level request contextvar is not available in those tasks.
-    """
-    # First, try to use the session property from the FastMCP Context
-    session = None
     try:
-        session = (
-            ctx.session
-        )  # This accesses the property which returns ctx.request_context.session
+        session = ctx.session
     except (AttributeError, ValueError):
-        # ctx.session property might raise ValueError if context not available
-        pass
+        session = None
 
-    if session is not None:
+    session_id = _extract_session_id_from_context(ctx)
+    identity: OAuthUserIdentity | None = None
+    try:
+        auth_user = auth_context_var.get()
+    except LookupError:
+        auth_user = None
+
+    if isinstance(auth_user, AuthenticatedUser):
+        access_token = getattr(auth_user, "access_token", None)
+        if access_token is not None:
+            try:
+                from mcp_agent.oauth.access_token import MCPAccessToken
+
+                if isinstance(access_token, MCPAccessToken):
+                    identity = OAuthUserIdentity.from_access_token(access_token)
+                else:
+                    token_dict = getattr(access_token, "model_dump", None)
+                    if callable(token_dict):
+                        maybe_token = MCPAccessToken.model_validate(token_dict())
+                        if maybe_token is not None:
+                            identity = OAuthUserIdentity.from_access_token(maybe_token)
+            except Exception:
+                identity = None
+
+    base_context: Context | None = None
+    lifespan_ctx = getattr(ctx.request_context, "lifespan_context", None)
+    if (
+        lifespan_ctx is not None
+        and hasattr(lifespan_ctx, "context")
+        and getattr(lifespan_ctx, "context", None) is not None
+    ):
+        base_context = lifespan_ctx.context
+
+    if base_context is None:
         app: MCPApp | None = _get_attached_app(ctx.fastmcp)
         if app is not None and getattr(app, "context", None) is not None:
-            # Set on global app context so the logger can access it
-            # Previously captured; no need to keep old value
-            # Use direct assignment for Pydantic model
-            app.context.upstream_session = session
-            return
-        else:
-            return
+            base_context = app.context
+
+    if identity is None and session_id:
+        identity = _session_identity_from_value(session_id)
+
+    if identity is None:
+        identity = DEFAULT_PRECONFIGURED_IDENTITY
+
+    bound_context: Context | None = None
+    token: Token | None = None
+
+    if base_context is not None:
+        previous_session = None
+        try:
+            previous_session = getattr(base_context, "upstream_session", None)
+        except Exception:
+            previous_session = None
+        bound_context = base_context.bind_request(
+            getattr(ctx, "request_context", None),
+            getattr(ctx, "fastmcp", None),
+        )
+        if session is not None:
+            bound_context.upstream_session = session
+        try:
+            setattr(bound_context, "_scoped_upstream_session", session)
+        except Exception:
+            pass
+        try:
+            setattr(bound_context, "_previous_upstream_session", previous_session)
+        except Exception:
+            pass
+        bound_context.request_session_id = session_id
+        bound_context.request_identity = identity
+        token = set_current_request_context(bound_context)
+        try:
+            setattr(bound_context, "_base_context_ref", base_context)
+        except Exception:
+            pass
+        if session is not None:
+            try:
+                setattr(base_context, "_last_known_upstream_session", session)
+            except Exception:
+                pass
+            app_ref = getattr(base_context, "app", None)
+            if app_ref is not None:
+                try:
+                    setattr(app_ref, "_last_known_upstream_session", session)
+                except Exception:
+                    pass
+        if session_id and identity is not None:
+            try:
+                base_context.identity_registry[session_id] = identity
+                logger.debug(
+                    "Registered identity for session",
+                    data={"session_id": session_id, "identity": identity.cache_key},
+                )
+            except Exception:
+                pass
+    else:
+        token = None
+
+    _set_current_identity(identity)
+    return bound_context, token
+
+
+def _exit_request_context(
+    bound_context: Optional["Context"], token: Token | None = None
+) -> None:
+    reset_current_request_context(token)
+    try:
+        _set_current_identity(None)
+    except Exception:
+        pass
+
+    if not isinstance(bound_context, Context):
+        return
+
+    base_context = getattr(bound_context, "_base_context_ref", None) or getattr(
+        bound_context, "_parent_context", None
+    )
+    session = getattr(bound_context, "_scoped_upstream_session", None)
+    targets: list[Any] = []
+    app_ref = None
+    if base_context is not None:
+        targets.append(base_context)
+        app_ref = getattr(base_context, "app", None)
+        if app_ref is not None:
+            targets.append(app_ref)
+
+    for target in targets:
+        _clear_cached_session_refs(target, session)
+
+    if base_context is not None and session is not None:
+        previous_session = getattr(bound_context, "_previous_upstream_session", None)
+        try:
+            if getattr(base_context, "upstream_session", None) is session:
+                base_context.upstream_session = previous_session
+        except Exception:
+            pass
+        if app_ref is not None:
+            try:
+                if getattr(app_ref, "upstream_session", None) is session:
+                    app_ref.upstream_session = previous_session
+            except Exception:
+                pass
+
+    for attr in (
+        "_base_context_ref",
+        "_scoped_upstream_session",
+        "_previous_upstream_session",
+    ):
+        try:
+            delattr(bound_context, attr)
+        except Exception:
+            pass
 
 
 def _resolve_workflows_and_context(
     ctx: MCPContext,
+    bound_context: Optional["Context"] = None,
 ) -> Tuple[Dict[str, Type["Workflow"]] | None, Optional["Context"]]:
     """Resolve the workflows mapping and underlying app context regardless of startup mode.
 
     Tries lifespan ServerContext first (including compatible mocks), then attached app.
-    Also ensures the app context is updated with the current upstream session once per request.
     """
-    # Try lifespan-provided ServerContext first
     lifespan_ctx = getattr(ctx.request_context, "lifespan_context", None)
     if (
         lifespan_ctx is not None
         and hasattr(lifespan_ctx, "workflows")
         and hasattr(lifespan_ctx, "context")
     ):
-        # Ensure upstream session once at resolution time
-        try:
-            _set_upstream_from_request_ctx_if_available(ctx)
-        except Exception:
-            pass
-        return lifespan_ctx.workflows, lifespan_ctx.context
+        workflows = lifespan_ctx.workflows
+        context = bound_context or getattr(lifespan_ctx, "context", None)
+        return workflows, context
 
-    # Fall back to app attached to FastMCP
     app: MCPApp | None = _get_attached_app(ctx.fastmcp)
 
     if app is not None:
-        # Ensure the app context has the current request's session set so background logs forward
-        try:
-            _set_upstream_from_request_ctx_if_available(ctx)
-        except Exception:
-            pass
-        return app.workflows, app.context
+        return app.workflows, bound_context or app.context
 
-    return None, None
+    return None, bound_context
+
+
+def _resolve_workflows_and_context_safe(
+    ctx: MCPContext, bound_context: Optional["Context"] = None
+) -> Tuple[Dict[str, Type["Workflow"]] | None, Optional["Context"]]:
+    resolver = _resolve_workflows_and_context
+    try:
+        return resolver(ctx, bound_context)
+    except TypeError:
+        # Backwards compatibility with mocks/tests that expect the older signature.
+        return resolver(ctx)  # type: ignore[misc]
+
+
+def _extract_session_id_from_context(ctx: MCPContext) -> str | None:
+    """Attempt to extract the caller's MCP session identifier from the request context."""
+    # Request-level meta (top-level)
+    try:
+        meta = getattr(ctx.request_context, "meta", None)
+        if meta is not None:
+            extra = getattr(meta, "model_extra", {}) or {}
+            session_id = (
+                getattr(meta, "sessionId", None)
+                or getattr(meta, "session_id", None)
+                or extra.get("sessionId")
+                or extra.get("session_id")
+            )
+            if session_id:
+                return str(session_id)
+    except Exception:
+        pass
+
+    # Parameters meta within the request payload
+    try:
+        req = getattr(ctx.request_context, "request", None)
+        if req is not None:
+            root = getattr(req, "root", None)
+            params = getattr(root, "params", None)
+            meta = getattr(params, "meta", None)
+            if meta is not None:
+                extra = getattr(meta, "model_extra", {}) or {}
+                session_id = (
+                    getattr(meta, "sessionId", None)
+                    or getattr(meta, "session_id", None)
+                    or extra.get("sessionId")
+                    or extra.get("session_id")
+                )
+                if session_id:
+                    return str(session_id)
+
+            query_params = getattr(req, "query_params", None)
+            if query_params is not None:
+                if "session_id" in query_params:
+                    return query_params.get("session_id")
+    except Exception:
+        pass
+
+    return None
 
 
 def _resolve_workflow_registry(ctx: MCPContext) -> WorkflowRegistry | None:
@@ -322,6 +651,34 @@ def create_mcp_server_for_app(app: MCPApp, **kwargs: Any) -> FastMCP:
         A configured FastMCP server instance
     """
 
+    auth_settings_config = None
+    try:
+        if app.context and app.context.config:
+            auth_settings_config = app.context.config.authorization
+    except Exception:
+        auth_settings_config = None
+
+    effective_auth_settings: AuthSettings | None = None
+    token_verifier: MCPAgentTokenVerifier | None = None
+    owns_token_verifier = False
+    if auth_settings_config and auth_settings_config.enabled:
+        try:
+            effective_auth_settings = AuthSettings(
+                issuer_url=auth_settings_config.issuer_url,  # type: ignore[arg-type]
+                resource_server_url=auth_settings_config.resource_server_url,  # type: ignore[arg-type]
+                service_documentation_url=auth_settings_config.service_documentation_url,  # type: ignore[arg-type]
+                required_scopes=auth_settings_config.required_scopes or None,
+            )
+            token_verifier = MCPAgentTokenVerifier(auth_settings_config)
+        except Exception as exc:
+            logger.error(
+                "Failed to configure authorization server integration",
+                exc_info=True,
+                data={"error": str(exc)},
+            )
+            effective_auth_settings = None
+            token_verifier = None
+
     # Create a lifespan function specific to this app
     @asynccontextmanager
     async def app_specific_lifespan(mcp: FastMCP) -> AsyncIterator[ServerContext]:
@@ -341,7 +698,11 @@ def create_mcp_server_for_app(app: MCPApp, **kwargs: Any) -> FastMCP:
             yield server_context
         finally:
             # Don't clean up the MCPApp here - let the caller handle that
-            pass
+            if owns_token_verifier and token_verifier is not None:
+                try:
+                    await token_verifier.aclose()
+                except Exception:
+                    pass
 
     # Helper: install internal HTTP routes (not MCP tools)
     def _install_internal_routes(mcp_server: FastMCP) -> None:
@@ -350,13 +711,81 @@ def create_mcp_server_for_app(app: MCPApp, **kwargs: Any) -> FastMCP:
 
             This helps when a workflow run's mapping has not been refreshed after a client reconnect.
             """
+            active_ctx = None
+            try:
+                active_ctx = get_current_request_context()
+            except Exception:
+                active_ctx = None
+            if active_ctx is not None:
+                try:
+                    upstream = getattr(active_ctx, "upstream_session", None)
+                    if upstream is not None:
+                        return upstream
+                except Exception:
+                    pass
+
             try:
                 app_obj: MCPApp | None = _get_attached_app(mcp_server)
-                if app_obj and getattr(app_obj, "context", None) is not None:
-                    return getattr(app_obj.context, "upstream_session", None)
             except Exception:
+                app_obj = None
+
+            if not app_obj:
                 return None
+
+            for candidate in (
+                getattr(app_obj, "_last_known_upstream_session", None),
+                getattr(app_obj, "_upstream_session", None),
+            ):
+                if candidate is not None:
+                    return candidate
+
+            base_ctx = getattr(app_obj, "context", None)
+            if base_ctx is None:
+                return None
+
+            for candidate in (
+                getattr(base_ctx, "_last_known_upstream_session", None),
+                getattr(base_ctx, "_upstream_session", None),
+            ):
+                if candidate is not None:
+                    return candidate
+
             return None
+
+        @mcp_server.custom_route(
+            "/internal/oauth/callback/{flow_id}",
+            methods=["GET", "POST"],
+            include_in_schema=False,
+        )
+        async def _oauth_callback(request: Request):
+            flow_id = request.path_params.get("flow_id")
+            if not flow_id:
+                return JSONResponse({"error": "missing_flow_id"}, status_code=400)
+
+            payload: Dict[str, Any] = {}
+            try:
+                payload.update({k: v for k, v in request.query_params.multi_items()})
+            except Exception:
+                payload.update(dict(request.query_params))
+
+            if request.method.upper() == "POST":
+                content_type = request.headers.get("content-type", "")
+                try:
+                    if "application/json" in content_type:
+                        body_data = await request.json()
+                    else:
+                        form = await request.form()
+                        body_data = {k: v for k, v in form.multi_items()}
+                except Exception:
+                    body_data = {}
+                payload.update(body_data)
+
+            delivered = await callback_registry.deliver(flow_id, payload)
+            if not delivered:
+                return JSONResponse({"error": "unknown_flow"}, status_code=404)
+
+            html = """<!DOCTYPE html><html><body><h3>Authorization complete.</h3><p>You may close this window and return to MCP Agent.</p></body></html>"""
+            return HTMLResponse(html)
 
         @mcp_server.custom_route(
             "/internal/session/by-run/{execution_id}/notify",
@@ -368,6 +797,9 @@ def create_mcp_server_for_app(app: MCPApp, **kwargs: Any) -> FastMCP:
             execution_id = request.path_params.get("execution_id")
             method = body.get("method")
             params = body.get("params") or {}
+            mapped_context = (
+                _get_context_for_execution(execution_id) if execution_id else None
+            )
 
             # Check authentication
             auth_error = _check_gateway_auth(request)
@@ -382,6 +814,10 @@ def create_mcp_server_for_app(app: MCPApp, **kwargs: Any) -> FastMCP:
                     if idempotency_key in seen:
                         return JSONResponse({"ok": True, "idempotent": True})
                     seen.add(idempotency_key)
+
+            mapped_context = (
+                _get_context_for_execution(execution_id) if execution_id else None
+            )
 
             # Prefer latest upstream session first
             latest_session = _get_fallback_upstream_session()
@@ -431,10 +867,17 @@ def create_mcp_server_for_app(app: MCPApp, **kwargs: Any) -> FastMCP:
                             )
                     # Successful with latest → bind mapping for consistency
                     try:
+                        identity = _get_identity_for_execution(execution_id)
+                        existing_context = _get_context_for_execution(execution_id)
                         await _register_session(
                             run_id=execution_id,
                             execution_id=execution_id,
                             session=latest_session,
+                            identity=identity,
+                            context=existing_context,
+                            session_id=getattr(
+                                existing_context, "request_session_id", None
+                            ),
                         )
                         # logger.info(
                         #     f"[notify] rebound mapping to latest session_id={id(latest_session)} for execution_id={execution_id}"
@@ -449,6 +892,9 @@ def create_mcp_server_for_app(app: MCPApp, **kwargs: Any) -> FastMCP:
 
             # Fallback to mapped session
             mapped_session = await _get_session(execution_id)
+            mapped_context = (
+                _get_context_for_execution(execution_id) if execution_id else None
+            )
             if not mapped_session:
                 logger.warning(
                     f"[notify] session_not_available for execution_id={execution_id} (tried_latest={tried_latest})"
@@ -456,6 +902,10 @@ def create_mcp_server_for_app(app: MCPApp, **kwargs: Any) -> FastMCP:
                 return JSONResponse(
                     {"ok": False, "error": "session_not_available"}, status_code=503
                 )
+
+            ctx_token: Token | None = None
+            if mapped_context is not None:
+                ctx_token = set_current_request_context(mapped_context)
 
             try:
                 if method == "notifications/message":
@@ -512,6 +962,8 @@ def create_mcp_server_for_app(app: MCPApp, **kwargs: Any) -> FastMCP:
                 return JSONResponse(
                     {"ok": False, "error": str(e_mapped)}, status_code=500
                 )
+            finally:
+                reset_current_request_context(ctx_token)
 
         # Helper function for shared authentication
         def _check_gateway_auth(request: Request) -> JSONResponse | None:
@@ -558,7 +1010,12 @@ def create_mcp_server_for_app(app: MCPApp, **kwargs: Any) -> FastMCP:
             return None
 
         async def _handle_specific_request(
-            session, method: str, params: dict, log_prefix: str = "request"
+            session: Any,
+            method: str,
+            params: dict,
+            identity: OAuthUserIdentity,
+            context: "Context",
+            log_prefix: str = "request",
         ):
             """Handle specific request types with structured request/response."""
             from mcp.types import (
@@ -582,10 +1039,12 @@ def create_mcp_server_for_app(app: MCPApp, **kwargs: Any) -> FastMCP:
                         params=CreateMessageRequestParams(**params),
                     )
                 )
-                result = await session.send_request(
+                callback_data = await session.send_request(
                     request=req, result_type=CreateMessageResult
                 )  # type: ignore[attr-defined]
-                return result.model_dump(by_alias=True, mode="json", exclude_none=True)
+                return callback_data.model_dump(
+                    by_alias=True, mode="json", exclude_none=True
+                )
             elif method == "elicitation/create":
                 req = ServerRequest(
                     ElicitRequest(
@@ -593,34 +1052,248 @@ def create_mcp_server_for_app(app: MCPApp, **kwargs: Any) -> FastMCP:
                         params=ElicitRequestParams(**params),
                     )
                 )
-                result = await session.send_request(
+                callback_data = await session.send_request(
                     request=req, result_type=ElicitResult
                 )  # type: ignore[attr-defined]
-                return result.model_dump(by_alias=True, mode="json", exclude_none=True)
+                return callback_data.model_dump(
+                    by_alias=True, mode="json", exclude_none=True
+                )
             elif method == "roots/list":
                 req = ServerRequest(ListRootsRequest(method="roots/list"))
-                result = await session.send_request(
+                callback_data = await session.send_request(
                     request=req, result_type=ListRootsResult
                 )  # type: ignore[attr-defined]
-                return result.model_dump(by_alias=True, mode="json", exclude_none=True)
+                return callback_data.model_dump(
+                    by_alias=True, mode="json", exclude_none=True
+                )
             elif method == "ping":
                 req = ServerRequest(PingRequest(method="ping"))
-                result = await session.send_request(
+                callback_data = await session.send_request(
                     request=req, result_type=EmptyResult
                 )  # type: ignore[attr-defined]
-                return result.model_dump(by_alias=True, mode="json", exclude_none=True)
+                return callback_data.model_dump(
+                    by_alias=True, mode="json", exclude_none=True
+                )
+            elif method == "auth/request":
+                # TODO: special handling of auth request, should be replaced by future URL elicitation
+
+                # first check to see if the token is in the cache already
+                server_name = params["server_name"]
+                scopes = params.get("scopes", [])
+                try:
+                    if context and hasattr(context, "token_manager"):
+                        manager = context.token_manager
+                        if manager:
+                            server_config = context.server_registry.get_server_config(
+                                server_name
+                            )
+
+                            token = await manager.get_access_token_if_present(
+                                context=context,
+                                server_name=server_name,
+                                server_config=server_config,
+                                scopes=scopes,
+                                identity=identity,
+                            )
+                            if token:
+                                return token
+                except Exception:
+                    # elicitation fallback below
+                    pass
+
+                # token is not present in the cache, perform the auth flow
+                record = await _perform_auth_flow(context, params, scopes, session)
+
+                # save in the token manager for next time
+                try:
+                    if context and hasattr(context, "token_manager"):
+                        manager = context.token_manager
+                        if manager:
+                            server_config = context.server_registry.get_server_config(
+                                server_name
+                            )
+
+                            token_data = {
+                                "access_token": record.access_token,
+                                "refresh_token": record.refresh_token,
+                                "scopes": record.scopes,
+                                "authorization_server": record.authorization_server,
+                                "expires_at": record.expires_at,
+                                "token_type": "Bearer",
+                            }
+
+                            await manager.store_user_token(
+                                context=context,
+                                user=identity,
+                                server_name=server_name,
+                                server_config=server_config,
+                                token_data=token_data,
+                            )
+                except Exception:
+                    pass
+
+                return {"token_record": record.model_dump_json()}
             else:
                 raise ValueError(f"unsupported method: {method}")
+
+        async def _perform_auth_flow(context, params, scopes, session):
+            from mcp.types import (
+                ElicitRequest,
+                ElicitRequestParams,
+                ElicitResult,
+            )
+
+            class AuthToken(BaseModel):
+                confirmation: str = Field(
+                    description="Please press enter to confirm this message has been received"
+                )
+
+            flow_id = params["flow_id"]
+            flow_timeout_seconds = params.get("flow_timeout_seconds")
+            state = params["state"]
+            token_endpoint = params["token_endpoint"]
+            redirect_uri = params["redirect_uri"]
+            client_id = params["client_id"]
+            code_verifier = params["code_verifier"]
+            resource = params.get("resource")
+            scope_param = params.get("scope_param")
+            extra_token_params = params.get("extra_token_params", {})
+            client_secret = params.get("client_secret")
+            issuer_str = params.get("issuer_str")
+            authorization_server_url = params.get("authorization_server_url")
+            callback_future = await callback_registry.create_handle(flow_id)
+            req = ElicitRequest(
+                method="elicitation/create",
+                params=ElicitRequestParams(
+                    message=params["message"] + "\n\n" + params["url"],
+                    requestedSchema=AuthToken.model_json_schema(),
+                ),
+            )
+            await session.send_request(request=req, result_type=ElicitResult)  # type: ignore[attr-defined]
+            timeout = 300
+            try:
+                callback_data = await asyncio.wait_for(callback_future, timeout=timeout)
+            except asyncio.TimeoutError as exc:
+                raise CallbackTimeoutError(
+                    f"Timed out waiting for OAuth callback after {timeout} seconds"
+                ) from exc
+            try:
+                if callback_data and callback_data.get("url"):
+                    callback_data = _parse_callback_params(callback_data["url"])
+                    if callback_future is not None:
+                        await callback_registry.discard(flow_id)
+                elif callback_data and callback_data.get("code"):
+                    callback_data = callback_data
+                    if callback_future is not None:
+                        await callback_registry.discard(flow_id)
+                elif callback_future is not None:
+                    timeout = flow_timeout_seconds or 300
+                    try:
+                        callback_data = await asyncio.wait_for(
+                            callback_future, timeout=timeout
+                        )
+                    except asyncio.TimeoutError as exc:
+                        raise CallbackTimeoutError(
+                            f"Timed out waiting for OAuth callback after {timeout} seconds"
+                        ) from exc
+                else:
+                    raise AuthorizationDeclined(
+                        "Authorization request was declined by the user"
+                    )
+            finally:
+                if callback_future is not None:
+                    await callback_registry.discard(flow_id)
+            error = callback_data.get("error")
+            if error:
+                description = callback_data.get("error_description") or error
+                raise OAuthFlowError(
+                    f"Authorization server returned error: {description}"
+                )
+            returned_state = callback_data.get("state")
+            if returned_state != state:
+                raise OAuthFlowError("State mismatch detected in OAuth callback")
+            authorization_code = callback_data.get("code")
+            if not authorization_code:
+                raise OAuthFlowError("Authorization callback did not include code")
+            token_endpoint = str(token_endpoint)
+            data: Dict[str, Any] = {
+                "grant_type": "authorization_code",
+                "code": authorization_code,
+                "redirect_uri": redirect_uri,
+                "client_id": client_id,
+                "code_verifier": code_verifier,
+                "resource": resource,
+            }
+            if scope_param:
+                data["scope"] = scope_param
+            if extra_token_params:
+                data.update(extra_token_params)
+            auth = None
+            if client_secret:
+                data["client_secret"] = client_secret
+            try:
+                if context and hasattr(context, "token_manager"):
+                    manager = context.token_manager
+                    if manager:
+                        http_client = manager._http_client
+            except Exception:
+                http_client = None
+            if not http_client:
+                http_client = httpx.AsyncClient(timeout=30.0)
+            token_response = await http_client.post(
+                token_endpoint,
+                data=data,
+                auth=auth,
+                headers={"Accept": "application/json"},
+            )
+            token_response.raise_for_status()
+            try:
+                callback_data = token_response.json()
+            except JSONDecodeError:
+                callback_data = _parse_callback_params("?" + token_response.text)
+            access_token = callback_data.get("access_token")
+            if not access_token:
+                raise OAuthFlowError("Token endpoint response missing access_token")
+            refresh_token = callback_data.get("refresh_token")
+            expires_in = callback_data.get("expires_in")
+            expires_at = None
+            if isinstance(expires_in, (int, float)):
+                expires_at = time.time() + float(expires_in)
+            scope_from_payload = callback_data.get("scope")
+            if isinstance(scope_from_payload, str) and scope_from_payload.strip():
+                effective_scopes = tuple(scope_from_payload.split())
+            else:
+                effective_scopes = tuple(scopes)
+            record = TokenRecord(
+                access_token=access_token,
+                refresh_token=refresh_token,
+                expires_at=expires_at,
+                scopes=effective_scopes,
+                token_type=str(callback_data.get("token_type", "Bearer")),
+                resource=resource,
+                authorization_server=issuer_str,
+                metadata={
+                    "raw": token_response.text,
+                    "authorization_server_url": authorization_server_url,
+                },
+            )
+            return record
 
         async def _try_session_request(
             session,
             method: str,
             params: dict,
             execution_id: str,
+            context: Optional["Context"],
             log_prefix: str = "request",
             register_session: bool = False,
         ):
             """Try to handle a request via session, with optional registration."""
+            try:
+                identity = _get_identity_for_execution(execution_id)
+            except Exception:
+                identity = None
+
             try:
                 # First try generic RPC passthrough
                 result = await _handle_request_via_rpc(
@@ -633,16 +1306,17 @@ def create_mcp_server_for_app(app: MCPApp, **kwargs: Any) -> FastMCP:
                                 run_id=execution_id,
                                 execution_id=execution_id,
                                 session=session,
+                                identity=identity,
+                                context=context,
+                                session_id=getattr(context, "request_session_id", None),
                             )
-                            # logger.debug(
-                            #     f"[{log_prefix}] rebound mapping to session_id={id(session)} for execution_id={execution_id}")
                         except Exception:
                             pass
                     return result
 
                 # Fallback to specific structured request handling
                 result = await _handle_specific_request(
-                    session, method, params, log_prefix
+                    session, method, params, identity, context, log_prefix
                 )
                 if register_session:
                     try:
@@ -650,9 +1324,10 @@ def create_mcp_server_for_app(app: MCPApp, **kwargs: Any) -> FastMCP:
                             run_id=execution_id,
                             execution_id=execution_id,
                             session=session,
+                            identity=identity,
+                            context=context,
+                            session_id=getattr(context, "request_session_id", None),
                         )
-                        # logger.debug(
-                        #     f"[{log_prefix}] rebound mapping to session_id={id(session)} for execution_id={execution_id}")
                     except Exception:
                         pass
                 return result
@@ -670,10 +1345,20 @@ def create_mcp_server_for_app(app: MCPApp, **kwargs: Any) -> FastMCP:
             include_in_schema=False,
         )
         async def _relay_request(request: Request):
+            app = _get_attached_app(mcp_server)
+            if app and app.context:
+                app_context = app.context
+            else:
+                app_context = None
+
             body = await request.json()
             execution_id = request.path_params.get("execution_id")
             method = body.get("method")
             params = body.get("params") or {}
+            mapped_context = (
+                _get_context_for_execution(execution_id) if execution_id else None
+            )
+            effective_context = mapped_context or app_context
 
             # Check authentication
             auth_error = _check_gateway_auth(request)
@@ -684,14 +1369,23 @@ def create_mcp_server_for_app(app: MCPApp, **kwargs: Any) -> FastMCP:
             latest_session = _get_fallback_upstream_session()
             if latest_session is not None:
                 try:
-                    result = await _try_session_request(
-                        latest_session,
-                        method,
-                        params,
-                        execution_id,
-                        log_prefix="request",
-                        register_session=True,
-                    )
+                    ctx_token_latest: Token | None = None
+                    if effective_context is not None:
+                        ctx_token_latest = set_current_request_context(
+                            effective_context
+                        )
+                    try:
+                        result = await _try_session_request(
+                            latest_session,
+                            method,
+                            params,
+                            execution_id,
+                            effective_context,
+                            log_prefix="request",
+                            register_session=True,
+                        )
+                    finally:
+                        reset_current_request_context(ctx_token_latest)
                     return JSONResponse(result)
                 except Exception as e_latest:
                     # Only log and continue to fallback if it's not an unsupported method error
@@ -699,6 +1393,12 @@ def create_mcp_server_for_app(app: MCPApp, **kwargs: Any) -> FastMCP:
                         logger.warning(
                             f"[request] latest session delivery failed for execution_id={execution_id} method={method}: {e_latest}"
                         )
+
+            # Refresh mapping after any rebinding that may have occurred above
+            mapped_context = (
+                _get_context_for_execution(execution_id) if execution_id else None
+            )
+            effective_context = mapped_context or app_context
 
             # Fallback to mapped session
             session = await _get_session(execution_id)
@@ -708,12 +1408,16 @@ def create_mcp_server_for_app(app: MCPApp, **kwargs: Any) -> FastMCP:
                 )
                 return JSONResponse({"error": "session_not_available"}, status_code=503)
 
+            ctx_token_mapped: Token | None = None
+            if effective_context is not None:
+                ctx_token_mapped = set_current_request_context(effective_context)
             try:
                 result = await _try_session_request(
                     session,
                     method,
                     params,
                     execution_id,
+                    effective_context,
                     log_prefix="request",
                     register_session=False,
                 )
@@ -730,6 +1434,8 @@ def create_mcp_server_for_app(app: MCPApp, **kwargs: Any) -> FastMCP:
                 except Exception:
                     pass
                 return JSONResponse({"error": str(e)}, status_code=500)
+            finally:
+                reset_current_request_context(ctx_token_mapped)
 
         @mcp_server.custom_route(
             "/internal/session/by-run/{workflow_id}/{execution_id}/async-request",
@@ -768,6 +1474,20 @@ def create_mcp_server_for_app(app: MCPApp, **kwargs: Any) -> FastMCP:
 
             # Create background task to handle the request and signal the workflow
             async def _handle_async_request_task():
+                app = _get_attached_app(mcp_server)
+                if app and app.context:
+                    app_context = app.context
+                else:
+                    app_context = None
+
+                mapped_context = (
+                    _get_context_for_execution(execution_id) if execution_id else None
+                )
+                effective_context = mapped_context or app_context
+                task_token: Token | None = None
+                if effective_context is not None:
+                    task_token = set_current_request_context(effective_context)
+
                 try:
                     result = None
 
@@ -775,14 +1495,23 @@ def create_mcp_server_for_app(app: MCPApp, **kwargs: Any) -> FastMCP:
                     latest_session = _get_fallback_upstream_session()
                     if latest_session is not None:
                         try:
-                            result = await _try_session_request(
-                                latest_session,
-                                method,
-                                params,
-                                execution_id,
-                                log_prefix="async-request",
-                                register_session=True,
-                            )
+                            ctx_token_latest: Token | None = None
+                            if effective_context is not None:
+                                ctx_token_latest = set_current_request_context(
+                                    effective_context
+                                )
+                            try:
+                                result = await _try_session_request(
+                                    latest_session,
+                                    method,
+                                    params,
+                                    execution_id,
+                                    effective_context,
+                                    log_prefix="async-request",
+                                    register_session=True,
+                                )
+                            finally:
+                                reset_current_request_context(ctx_token_latest)
                         except Exception as e_latest:
                             logger.warning(
                                 f"[async-request] latest session delivery failed for execution_id={execution_id} method={method}: {e_latest}"
@@ -793,14 +1522,23 @@ def create_mcp_server_for_app(app: MCPApp, **kwargs: Any) -> FastMCP:
                         session = await _get_session(execution_id)
                         if session:
                             try:
-                                result = await _try_session_request(
-                                    session,
-                                    method,
-                                    params,
-                                    execution_id,
-                                    log_prefix="async-request",
-                                    register_session=False,
-                                )
+                                ctx_token_mapped: Token | None = None
+                                if mapped_context is not None:
+                                    ctx_token_mapped = set_current_request_context(
+                                        mapped_context
+                                    )
+                                try:
+                                    result = await _try_session_request(
+                                        session,
+                                        method,
+                                        params,
+                                        execution_id,
+                                        mapped_context or app_context,
+                                        log_prefix="async-request",
+                                        register_session=False,
+                                    )
+                                finally:
+                                    reset_current_request_context(ctx_token_mapped)
                             except Exception as e:
                                 logger.error(
                                     f"[async-request] error forwarding for execution_id={execution_id} method={method}: {e}"
@@ -815,9 +1553,8 @@ def create_mcp_server_for_app(app: MCPApp, **kwargs: Any) -> FastMCP:
                     # Signal the workflow with the result using method-specific signal
                     try:
                         # Try to get Temporal client from the app context
-                        app = _get_attached_app(mcp_server)
-                        if app and app.context and hasattr(app.context, "executor"):
-                            executor = app.context.executor
+                        if app_context and hasattr(app_context, "executor"):
+                            executor = app_context.executor
                             if hasattr(executor, "client"):
                                 client = executor.client
                                 # Find the workflow using execution_id as both workflow_id and run_id
@@ -841,6 +1578,8 @@ def create_mcp_server_for_app(app: MCPApp, **kwargs: Any) -> FastMCP:
 
                 except Exception as e:
                     logger.error(f"[async-request] background task error: {e}")
+                finally:
+                    reset_current_request_context(task_token)
 
             # Start the background task
             asyncio.create_task(_handle_async_request_task())
@@ -877,27 +1616,44 @@ def create_mcp_server_for_app(app: MCPApp, **kwargs: Any) -> FastMCP:
             if auth_error:
                 return auth_error
 
+            mapped_context = (
+                _get_context_for_execution(execution_id) if execution_id else None
+            )
+
             # Prefer latest upstream session first
             latest_session = _get_fallback_upstream_session()
             if latest_session is not None:
                 try:
-                    await latest_session.send_log_message(  # type: ignore[attr-defined]
-                        level=level,  # type: ignore[arg-type]
-                        data={
-                            "message": message,
-                            "namespace": namespace,
-                            "data": data,
-                        },
-                        logger=namespace,
-                    )
+                    latest_token: Token | None = None
+                    if mapped_context is not None:
+                        latest_token = set_current_request_context(mapped_context)
+                    try:
+                        await latest_session.send_log_message(  # type: ignore[attr-defined]
+                            level=level,  # type: ignore[arg-type]
+                            data={
+                                "message": message,
+                                "namespace": namespace,
+                                "data": data,
+                            },
+                            logger=namespace,
+                        )
+                    finally:
+                        reset_current_request_context(latest_token)
                     logger.debug(
                         f"[log] delivered via latest session_id={id(latest_session)} level={level} ns={namespace}"
                     )
                     try:
+                        identity = _get_identity_for_execution(execution_id)
+                        existing_context = _get_context_for_execution(execution_id)
                         await _register_session(
                             run_id=execution_id,
                             execution_id=execution_id,
                             session=latest_session,
+                            identity=identity,
+                            context=existing_context,
+                            session_id=getattr(
+                                existing_context, "request_session_id", None
+                            ),
                         )
                         logger.info(
                             f"[log] rebound mapping to latest session_id={id(latest_session)} for execution_id={execution_id}"
@@ -922,15 +1678,21 @@ def create_mcp_server_for_app(app: MCPApp, **kwargs: Any) -> FastMCP:
             if level not in ("debug", "info", "warning", "error"):
                 level = "info"
             try:
-                await session.send_log_message(
-                    level=level,  # type: ignore[arg-type]
-                    data={
-                        "message": message,
-                        "namespace": namespace,
-                        "data": data,
-                    },
-                    logger=namespace,
-                )
+                mapped_token: Token | None = None
+                if mapped_context is not None:
+                    mapped_token = set_current_request_context(mapped_context)
+                try:
+                    await session.send_log_message(
+                        level=level,  # type: ignore[arg-type]
+                        data={
+                            "message": message,
+                            "namespace": namespace,
+                            "data": data,
+                        },
+                        logger=namespace,
+                    )
+                finally:
+                    reset_current_request_context(mapped_token)
                 return JSONResponse({"ok": True})
             except Exception as e:
                 return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
@@ -955,6 +1717,13 @@ def create_mcp_server_for_app(app: MCPApp, **kwargs: Any) -> FastMCP:
             if auth_error:
                 return auth_error
 
+            app_obj = _get_attached_app(mcp_server)
+            app_context = getattr(app_obj, "context", None) if app_obj else None
+            mapped_context = (
+                _get_context_for_execution(execution_id) if execution_id else None
+            )
+            effective_context = mapped_context or app_context
+
             # Prefer latest upstream session first
             latest_session = _get_fallback_upstream_session()
             import uuid
@@ -978,16 +1747,40 @@ def create_mcp_server_for_app(app: MCPApp, **kwargs: Any) -> FastMCP:
                 # Try latest first
                 if latest_session is not None:
                     try:
-                        await latest_session.send_log_message(  # type: ignore[attr-defined]
-                            level="info",  # type: ignore[arg-type]
-                            data=payload,
-                            logger="mcp_agent.human",
-                        )
+                        latest_token: Token | None = None
+                        if effective_context is not None:
+                            latest_token = set_current_request_context(
+                                effective_context
+                            )
                         try:
+                            await latest_session.send_log_message(  # type: ignore[attr-defined]
+                                level="info",  # type: ignore[arg-type]
+                                data=payload,
+                                logger="mcp_agent.human",
+                            )
+                        finally:
+                            reset_current_request_context(latest_token)
+                        try:
+                            identity = _get_identity_for_execution(execution_id)
+                            if identity is None:
+                                identity = _session_identity_from_value(
+                                    metadata.get("session_id")
+                                    or metadata.get("sessionId")
+                                )
+                            existing_context = _get_context_for_execution(execution_id)
+                            session_key = metadata.get("session_id") or metadata.get(
+                                "sessionId"
+                            )
                             await _register_session(
                                 run_id=execution_id,
                                 execution_id=execution_id,
                                 session=latest_session,
+                                identity=identity,
+                                context=existing_context,
+                                session_id=session_key
+                                or getattr(
+                                    existing_context, "request_session_id", None
+                                ),
                             )
                             logger.info(
                                 f"[human] rebound mapping to latest session_id={id(latest_session)} for execution_id={execution_id}"
@@ -1001,16 +1794,26 @@ def create_mcp_server_for_app(app: MCPApp, **kwargs: Any) -> FastMCP:
                         )
 
                 # Fallback to mapped session
+                mapped_context = (
+                    _get_context_for_execution(execution_id) if execution_id else None
+                )
+                effective_context = mapped_context or app_context
                 session = await _get_session(execution_id)
                 if not session:
                     return JSONResponse(
                         {"error": "session_not_available"}, status_code=503
                     )
-                await session.send_log_message(
-                    level="info",  # type: ignore[arg-type]
-                    data=payload,
-                    logger="mcp_agent.human",
-                )
+                mapped_token: Token | None = None
+                if effective_context is not None:
+                    mapped_token = set_current_request_context(effective_context)
+                try:
+                    await session.send_log_message(
+                        level="info",  # type: ignore[arg-type]
+                        data=payload,
+                        logger="mcp_agent.human",
+                    )
+                finally:
+                    reset_current_request_context(mapped_token)
                 return JSONResponse({"request_id": request_id})
             except Exception as e:
                 return JSONResponse({"error": str(e)}, status_code=500)
@@ -1039,6 +1842,14 @@ def create_mcp_server_for_app(app: MCPApp, **kwargs: Any) -> FastMCP:
         except Exception:
             pass
     else:
+        if "icons" not in kwargs and app._icons:
+            kwargs["icons"] = app._icons
+        if "auth" not in kwargs and effective_auth_settings is not None:
+            kwargs["auth"] = effective_auth_settings
+        if "token_verifier" not in kwargs and token_verifier is not None:
+            kwargs["token_verifier"] = token_verifier
+            owns_token_verifier = True
+
         mcp = FastMCP(
             name=app.name or "mcp_agent_server",
             # TODO: saqadri (MAC) - create a much more detailed description
@@ -1067,32 +1878,54 @@ def create_mcp_server_for_app(app: MCPApp, **kwargs: Any) -> FastMCP:
             async def _set_level(
                 level: str,
             ) -> None:  # mcp.types.LoggingLevel is a Literal[str]
+                ctx_obj: MCPContext | None = None
                 try:
-                    LoggingConfig.set_min_level(level)
+                    ctx_obj = mcp.get_context() if hasattr(mcp, "get_context") else None
                 except Exception:
-                    # Best-effort, do not crash server on invalid level
+                    ctx_obj = None
+
+                bound_ctx: Context | None = None
+                token: Token | None = None
+                if ctx_obj is not None:
+                    try:
+                        bound_ctx, token = _enter_request_context(ctx_obj)
+                    except Exception:
+                        bound_ctx, token = None, None
+
+                try:
+                    session_id = (
+                        getattr(bound_ctx, "request_session_id", None)
+                        if bound_ctx is not None
+                        else None
+                    )
+                    if session_id:
+                        LoggingConfig.set_session_min_level(session_id, level)
+                    else:
+                        LoggingConfig.set_min_level(level)
+                except Exception:
                     pass
+                finally:
+                    _exit_request_context(bound_ctx, token)
     except Exception:
         # If handler registration fails, continue without dynamic level updates
         pass
 
     # region Workflow Tools
 
-    @mcp.tool(name="workflows-list")
+    @mcp.tool(name="workflows-list", icons=[phetch])
     def list_workflows(ctx: MCPContext) -> Dict[str, Dict[str, Any]]:
         """
         List all available workflow types with their detailed information.
         Returns information about each workflow type including name, description, and parameters.
         This helps in making an informed decision about which workflow to run.
         """
-        # Ensure upstream session is set for any logs emitted during this call
+        bound_ctx, token = _enter_request_context(ctx)
         try:
-            _set_upstream_from_request_ctx_if_available(ctx)
-        except Exception:
-            pass
-        result: Dict[str, Dict[str, Any]] = {}
-        workflows, _ = _resolve_workflows_and_context(ctx)
-        workflows = workflows or {}
+            result: Dict[str, Dict[str, Any]] = {}
+            workflows, _ = _resolve_workflows_and_context_safe(ctx, bound_ctx)
+            workflows = workflows or {}
+        finally:
+            _exit_request_context(bound_ctx, token)
         for workflow_name, workflow_cls in workflows.items():
             # Determine parameter schema (strip self / prefer original function)
             run_fn_tool = _build_run_param_tool(workflow_cls)
@@ -1121,7 +1954,7 @@ def create_mcp_server_for_app(app: MCPApp, **kwargs: Any) -> FastMCP:
 
         return result
 
-    @mcp.tool(name="workflows-runs-list")
+    @mcp.tool(name="workflows-runs-list", icons=[phetch])
     async def list_workflow_runs(
         ctx: MCPContext,
         limit: int = 100,
@@ -1144,41 +1977,40 @@ def create_mcp_server_for_app(app: MCPApp, **kwargs: Any) -> FastMCP:
         Returns:
             A list of workflow run status dictionaries with detailed workflow information.
         """
-        # Ensure upstream session is set for any logs emitted during this call
+        bound_ctx, token = _enter_request_context(ctx)
         try:
-            _set_upstream_from_request_ctx_if_available(ctx)
-        except Exception:
-            pass
+            server_context = getattr(
+                ctx.request_context, "lifespan_context", None
+            ) or _get_attached_server_context(ctx.fastmcp)
+            if server_context is None or not hasattr(
+                server_context, "workflow_registry"
+            ):
+                raise ToolError("Server context not available for MCPApp Server.")
 
-        server_context = getattr(
-            ctx.request_context, "lifespan_context", None
-        ) or _get_attached_server_context(ctx.fastmcp)
-        if server_context is None or not hasattr(server_context, "workflow_registry"):
-            raise ToolError("Server context not available for MCPApp Server.")
+            # Decode next_page_token if provided (base64-encoded string -> bytes)
+            token_bytes = None
+            if next_page_token:
+                try:
+                    import base64 as _b64
 
-        # Decode next_page_token if provided (base64-encoded string -> bytes)
-        token_bytes = None
-        if next_page_token:
-            try:
-                import base64 as _b64
+                    token_bytes = _b64.b64decode(next_page_token)
+                except Exception:
+                    token_bytes = None
 
-                token_bytes = _b64.b64decode(next_page_token)
-            except Exception:
-                token_bytes = None
-
-        # Get workflow statuses from the registry with pagination/query hints
-        workflow_statuses = (
-            await server_context.workflow_registry.list_workflow_statuses(
-                query=None,
-                limit=limit,
-                page_size=page_size,
-                next_page_token=token_bytes,
+            # Get workflow statuses from the registry with pagination/query hints
+            workflow_statuses = (
+                await server_context.workflow_registry.list_workflow_statuses(
+                    query=None,
+                    limit=limit,
+                    page_size=page_size,
+                    next_page_token=token_bytes,
+                )
             )
-        )
+            return workflow_statuses
+        finally:
+            _exit_request_context(bound_ctx, token)
 
-        return workflow_statuses
-
-    @mcp.tool(name="workflows-run")
+    @mcp.tool(name="workflows-run", icons=[phetch])
     async def run_workflow(
         ctx: MCPContext,
         workflow_name: str,
@@ -1198,14 +2030,15 @@ def create_mcp_server_for_app(app: MCPApp, **kwargs: Any) -> FastMCP:
             A dict with workflow_id and run_id for the started workflow run, can be passed to
             workflows/get_status, workflows/resume, and workflows/cancel.
         """
-        # Ensure upstream session is set before starting the workflow
+        bound_ctx, token = _enter_request_context(ctx)
         try:
-            _set_upstream_from_request_ctx_if_available(ctx)
-        except Exception:
-            pass
-        return await _workflow_run(ctx, workflow_name, run_parameters, **kwargs)
+            return await _workflow_run(
+                ctx, workflow_name, run_parameters, bound_context=bound_ctx, **kwargs
+            )
+        finally:
+            _exit_request_context(bound_ctx, token)
 
-    @mcp.tool(name="workflows-get_status")
+    @mcp.tool(name="workflows-get_status", icons=[phetch])
     async def get_workflow_status(
         ctx: MCPContext,
         run_id: str | None = None,
@@ -1228,24 +2061,35 @@ def create_mcp_server_for_app(app: MCPApp, **kwargs: Any) -> FastMCP:
         Returns:
             A dictionary with comprehensive information about the workflow status.
         """
-        # Ensure upstream session is available for any status-related logs
+        bound_ctx, token = _enter_request_context(ctx)
         try:
-            _set_upstream_from_request_ctx_if_available(ctx)
-        except Exception:
-            pass
-        # Opportunistically re-bind the upstream session mapping to this request's session
-        try:
-            sess = getattr(ctx, "session", None)
-            if sess and run_id:
-                exec_id = _RUN_EXECUTION_ID_REGISTRY.get(run_id, run_id)
-                await _register_session(
-                    run_id=run_id, execution_id=exec_id, session=sess
-                )
-        except Exception:
-            pass
-        return await _workflow_status(ctx, run_id=run_id, workflow_id=workflow_id)
+            try:
+                sess = getattr(ctx, "session", None)
+                if sess and run_id:
+                    exec_id = _RUN_EXECUTION_ID_REGISTRY.get(run_id, run_id)
+                    app_obj = _get_attached_app(ctx.fastmcp)
+                    app_ctx = getattr(app_obj, "context", None) if app_obj else None
+                    identity = _resolve_identity_for_request(ctx, app_ctx, exec_id)
+                    await _register_session(
+                        run_id=run_id,
+                        execution_id=exec_id,
+                        session=sess,
+                        identity=identity,
+                        context=bound_ctx,
+                        session_id=getattr(bound_ctx, "request_session_id", None),
+                    )
+            except Exception:
+                pass
+            return await _workflow_status(
+                ctx,
+                run_id=run_id,
+                workflow_id=workflow_id,
+                bound_context=bound_ctx,
+            )
+        finally:
+            _exit_request_context(bound_ctx, token)
 
-    @mcp.tool(name="workflows-resume")
+    @mcp.tool(name="workflows-resume", icons=[phetch])
     async def resume_workflow(
         ctx: MCPContext,
         run_id: str | None = None,
@@ -1272,54 +2116,59 @@ def create_mcp_server_for_app(app: MCPApp, **kwargs: Any) -> FastMCP:
         Returns:
             True if the workflow was resumed, False otherwise.
         """
-        # Ensure upstream session is available for any status-related logs
+        bound_ctx, token = _enter_request_context(ctx)
         try:
-            _set_upstream_from_request_ctx_if_available(ctx)
-        except Exception:
-            pass
-        # Re-bind mapping for this run to ensure worker notifies reach the current client session
-        try:
-            sess = getattr(ctx, "session", None)
-            if sess and run_id:
-                exec_id = _RUN_EXECUTION_ID_REGISTRY.get(run_id, run_id)
-                await _register_session(
-                    run_id=run_id, execution_id=exec_id, session=sess
+            try:
+                sess = getattr(ctx, "session", None)
+                if sess and run_id:
+                    exec_id = _RUN_EXECUTION_ID_REGISTRY.get(run_id, run_id)
+                    app_obj = _get_attached_app(ctx.fastmcp)
+                    app_ctx = getattr(app_obj, "context", None) if app_obj else None
+                    identity = _resolve_identity_for_request(ctx, app_ctx, exec_id)
+                    await _register_session(
+                        run_id=run_id,
+                        execution_id=exec_id,
+                        session=sess,
+                        identity=identity,
+                        context=bound_ctx,
+                        session_id=getattr(bound_ctx, "request_session_id", None),
+                    )
+            except Exception:
+                pass
+
+            if run_id is None and workflow_id is None:
+                raise ToolError("Either run_id or workflow_id must be provided.")
+
+            workflow_registry: WorkflowRegistry | None = _resolve_workflow_registry(ctx)
+
+            if not workflow_registry:
+                raise ToolError("Workflow registry not found for MCPApp Server.")
+
+            logger.info(
+                f"Resuming workflow ID {workflow_id or 'unknown'}, run ID {run_id or 'unknown'} with signal '{signal_name}' and payload '{payload}'"
+            )
+
+            result = await workflow_registry.resume_workflow(
+                run_id=run_id,
+                workflow_id=workflow_id,
+                signal_name=signal_name,
+                payload=payload,
+            )
+
+            if result:
+                logger.debug(
+                    f"Signaled workflow ID {workflow_id or 'unknown'}, run ID {run_id or 'unknown'} with signal '{signal_name}' and payload '{payload}'"
                 )
-        except Exception:
-            pass
+            else:
+                logger.error(
+                    f"Failed to signal workflow ID {workflow_id or 'unknown'}, run ID {run_id or 'unknown'} with signal '{signal_name}' and payload '{payload}'"
+                )
 
-        if run_id is None and workflow_id is None:
-            raise ToolError("Either run_id or workflow_id must be provided.")
+            return result
+        finally:
+            _exit_request_context(bound_ctx, token)
 
-        workflow_registry: WorkflowRegistry | None = _resolve_workflow_registry(ctx)
-
-        if not workflow_registry:
-            raise ToolError("Workflow registry not found for MCPApp Server.")
-
-        logger.info(
-            f"Resuming workflow ID {workflow_id or 'unknown'}, run ID {run_id or 'unknown'} with signal '{signal_name}' and payload '{payload}'"
-        )
-
-        # Get the workflow instance from the registry
-        result = await workflow_registry.resume_workflow(
-            run_id=run_id,
-            workflow_id=workflow_id,
-            signal_name=signal_name,
-            payload=payload,
-        )
-
-        if result:
-            logger.debug(
-                f"Signaled workflow ID {workflow_id or 'unknown'}, run ID {run_id or 'unknown'} with signal '{signal_name}' and payload '{payload}'"
-            )
-        else:
-            logger.error(
-                f"Failed to signal workflow ID {workflow_id or 'unknown'}, run ID {run_id or 'unknown'} with signal '{signal_name}' and payload '{payload}'"
-            )
-
-        return result
-
-    @mcp.tool(name="workflows-cancel")
+    @mcp.tool(name="workflows-cancel", icons=[phetch])
     async def cancel_workflow(
         ctx: MCPContext, run_id: str | None = None, workflow_id: str | None = None
     ) -> bool:
@@ -1337,49 +2186,175 @@ def create_mcp_server_for_app(app: MCPApp, **kwargs: Any) -> FastMCP:
         Returns:
             True if the workflow was cancelled, False otherwise.
         """
-        # Ensure upstream session is available for any status-related logs
+        bound_ctx, token = _enter_request_context(ctx)
         try:
-            _set_upstream_from_request_ctx_if_available(ctx)
-        except Exception:
-            pass
-        # Re-bind mapping for this run to ensure worker notifies reach the current client session
-        try:
-            sess = getattr(ctx, "session", None)
-            if sess and run_id:
-                exec_id = _RUN_EXECUTION_ID_REGISTRY.get(run_id, run_id)
-                await _register_session(
-                    run_id=run_id, execution_id=exec_id, session=sess
+            try:
+                sess = getattr(ctx, "session", None)
+                if sess and run_id:
+                    exec_id = _RUN_EXECUTION_ID_REGISTRY.get(run_id, run_id)
+                    app_obj = _get_attached_app(ctx.fastmcp)
+                    app_ctx = getattr(app_obj, "context", None) if app_obj else None
+                    identity = _resolve_identity_for_request(ctx, app_ctx, exec_id)
+                    await _register_session(
+                        run_id=run_id,
+                        execution_id=exec_id,
+                        session=sess,
+                        identity=identity,
+                        context=bound_ctx,
+                        session_id=getattr(bound_ctx, "request_session_id", None),
+                    )
+            except Exception:
+                pass
+
+            if run_id is None and workflow_id is None:
+                raise ToolError("Either run_id or workflow_id must be provided.")
+
+            workflow_registry: WorkflowRegistry | None = _resolve_workflow_registry(ctx)
+
+            if not workflow_registry:
+                raise ToolError("Workflow registry not found for MCPApp Server.")
+
+            logger.info(
+                f"Cancelling workflow ID {workflow_id or 'unknown'}, run ID {run_id or 'unknown'}"
+            )
+
+            result = await workflow_registry.cancel_workflow(
+                run_id=run_id, workflow_id=workflow_id
+            )
+
+            if result:
+                logger.debug(
+                    f"Cancelled workflow ID {workflow_id or 'unknown'}, run ID {run_id or 'unknown'}"
                 )
-        except Exception:
-            pass
+            else:
+                logger.error(
+                    f"Failed to cancel workflow {workflow_id or 'unknown'} with ID {run_id or 'unknown'}"
+                )
 
-        if run_id is None and workflow_id is None:
-            raise ToolError("Either run_id or workflow_id must be provided.")
+            return result
+        finally:
+            _exit_request_context(bound_ctx, token)
 
-        workflow_registry: WorkflowRegistry | None = _resolve_workflow_registry(ctx)
+    @mcp.tool(name="workflows-store-credentials")
+    async def workflow_store_credentials(
+        ctx: MCPContext, workflow_name: str, tokens: List[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """
+        Store OAuth tokens for a workflow to use with MCP servers.
 
-        if not workflow_registry:
-            raise ToolError("Workflow registry not found for MCPApp Server.")
+        Persisting tokens ahead of time lets workflows authenticate with external services
+        without needing an interactive OAuth flow at execution time.
 
-        logger.info(
-            f"Cancelling workflow ID {workflow_id or 'unknown'}, run ID {run_id or 'unknown'}"
-        )
+        Args:
+            workflow_name: The name of the workflow that will use these tokens.
+            tokens: List of OAuth token objects, each containing:
+                - access_token (str): The OAuth access token
+                - refresh_token (str, optional): The OAuth refresh token
+                - server_name (str): Name/identifier of the MCP server
+                - scopes (List[str], optional): List of OAuth scopes
+                - expires_at (float, optional): Token expiration timestamp
+                - authorization_server (str, optional): Authorization server URL
 
-        # Get the workflow instance from the registry
-        result = await workflow_registry.cancel_workflow(
-            run_id=run_id, workflow_id=workflow_id
-        )
-
-        if result:
-            logger.debug(
-                f"Cancelled workflow ID {workflow_id or 'unknown'}, run ID {run_id or 'unknown'}"
+        Returns:
+            Dictionary with success status and count of stored tokens.
+        """
+        bound_ctx, token = _enter_request_context(ctx)
+        try:
+            workflows_dict, app_context = _resolve_workflows_and_context_safe(
+                ctx, bound_ctx
             )
-        else:
+            if not workflows_dict or not app_context:
+                raise ToolError("Server context not available for MCPApp Server.")
+
+            if workflow_name not in workflows_dict:
+                raise ToolError(f"Workflow '{workflow_name}' not found.")
+
+            if not app_context.token_manager:
+                raise ToolError("OAuth token manager not available.")
+
+            identity = _resolve_identity_for_request(ctx, app_context)
+
+            if not tokens:
+                raise ToolError("At least one token must be provided.")
+
+            stored_count = 0
+            errors = []
+
+            for i, token_data in enumerate(tokens):
+                try:
+                    if not isinstance(token_data, dict):
+                        errors.append(f"Token {i}: must be a dictionary")
+                        continue
+
+                    access_token = token_data.get("access_token")
+                    server_name = token_data.get("server_name")
+
+                    if not access_token:
+                        errors.append(
+                            f"Token {i}: missing required 'access_token' field"
+                        )
+                        continue
+
+                    if not server_name:
+                        errors.append(
+                            f"Token {i}: missing required 'server_name' field"
+                        )
+                        continue
+
+                    server_config = app_context.server_registry.registry.get(
+                        server_name
+                    )
+                    if not server_config:
+                        errors.append(
+                            f"Token {i}: server '{server_name}' not recognized"
+                        )
+                        continue
+
+                    await app_context.token_manager.store_user_token(
+                        context=app_context,
+                        user=identity,
+                        server_name=server_name,
+                        server_config=server_config,
+                        token_data=token_data,
+                        workflow_name=workflow_name,
+                    )
+                    stored_count += 1
+                except Exception as e:
+                    errors.append(f"Token {i}: {str(e)}")
+                    logger.error(
+                        f"Error storing token {i} for workflow '{workflow_name}': {e}"
+                    )
+
+            if errors and stored_count == 0:
+                raise ToolError(
+                    f"Failed to store any tokens. Errors: {'; '.join(errors)}"
+                )
+
+            result = {
+                "success": True,
+                "workflow_name": workflow_name,
+                "stored_tokens": stored_count,
+                "total_tokens": len(tokens),
+            }
+
+            if errors:
+                result["errors"] = errors
+                result["partial_success"] = True
+
+            logger.info(
+                f"Pre-authorization completed for workflow '{workflow_name}': "
+                f"{stored_count}/{len(tokens)} tokens stored"
+            )
+
+            return result
+
+        except Exception as e:
             logger.error(
-                f"Failed to cancel workflow {workflow_id or 'unknown'} with ID {run_id or 'unknown'}"
+                f"Error in workflow pre-authorization for '{workflow_name}': {e}"
             )
-
-        return result
+            raise ToolError(f"Failed to store tokens: {str(e)}")
+        finally:
+            _exit_request_context(bound_ctx, token)
 
     # endregion
 
@@ -1449,6 +2424,46 @@ def create_declared_function_tools(mcp: FastMCP, server_context: ServerContext):
     import inspect
     import asyncio
     import time
+    import typing as _typing
+
+    try:
+        from mcp.server.fastmcp import Context as _Ctx
+    except Exception:
+        _Ctx = None  # type: ignore
+
+    def _annotation_is_fast_ctx(annotation) -> bool:
+        if _Ctx is None or annotation is inspect._empty:
+            return False
+        if annotation is _Ctx:
+            return True
+        if inspect.isclass(annotation):
+            try:
+                if issubclass(annotation, _Ctx):  # type: ignore[misc]
+                    return True
+            except TypeError:
+                pass
+        try:
+            origin = _typing.get_origin(annotation)
+            if origin is not None:
+                return any(
+                    _annotation_is_fast_ctx(arg) for arg in _typing.get_args(annotation)
+                )
+        except Exception:
+            pass
+        try:
+            return "fastmcp" in str(annotation)
+        except Exception:
+            return False
+
+    def _detect_context_param(signature: inspect.Signature) -> str | None:
+        for param in signature.parameters.values():
+            if param.name == "app_ctx":
+                continue
+            if _annotation_is_fast_ctx(param.annotation):
+                return param.name
+            if param.annotation is inspect._empty and param.name in {"ctx", "context"}:
+                return param.name
+        return None
 
     async def _wait_for_completion(
         ctx: MCPContext,
@@ -1528,6 +2543,10 @@ def create_declared_function_tools(mcp: FastMCP, server_context: ServerContext):
         fn = decl.get("source_fn")
         description = decl.get("description")
         structured_output = decl.get("structured_output")
+        title = decl.get("title")
+        annotations = decl.get("annotations")
+        icons = decl.get("icons")
+        meta = decl.get("meta")
 
         # Bind per-iteration values to avoid late-binding closure bugs
         name_local = name
@@ -1540,9 +2559,18 @@ def create_declared_function_tools(mcp: FastMCP, server_context: ServerContext):
             def _make_wrapper(bound_wname: str):
                 async def _wrapper(**kwargs):
                     ctx: MCPContext = kwargs.pop("__context__")
-                    result_ids = await _workflow_run(ctx, bound_wname, kwargs)
-                    run_id = result_ids["run_id"]
-                    result = await _wait_for_completion(ctx, run_id)
+                    bound_ctx, token = _enter_request_context(ctx)
+                    try:
+                        result_ids = await _workflow_run(
+                            ctx,
+                            bound_wname,
+                            kwargs,
+                            bound_context=bound_ctx,
+                        )
+                        run_id = result_ids["run_id"]
+                        result = await _wait_for_completion(ctx, run_id)
+                    finally:
+                        _exit_request_context(bound_ctx, token)
                     try:
                         from mcp_agent.executor.workflow import WorkflowResult as _WFRes
                     except Exception:
@@ -1564,23 +2592,29 @@ def create_declared_function_tools(mcp: FastMCP, server_context: ServerContext):
             ann = dict(getattr(fn, "__annotations__", {}))
             ann.pop("app_ctx", None)
 
-            ctx_param_name = "ctx"
-            from mcp.server.fastmcp import Context as _Ctx
+            existing_ctx_param = _detect_context_param(sig)
+            ctx_param_name = existing_ctx_param or "ctx"
 
-            ann[ctx_param_name] = _Ctx
+            if _Ctx is not None:
+                ann[ctx_param_name] = _Ctx
             ann["return"] = getattr(fn, "__annotations__", {}).get("return", return_ann)
             _wrapper.__annotations__ = ann
             _wrapper.__name__ = name_local
             _wrapper.__doc__ = description or (fn.__doc__ or "")
 
             params = [p for p in sig.parameters.values() if p.name != "app_ctx"]
-            ctx_param = inspect.Parameter(
-                ctx_param_name,
-                kind=inspect.Parameter.KEYWORD_ONLY,
-                annotation=_Ctx,
-            )
+            if existing_ctx_param is None:
+                ctx_param = inspect.Parameter(
+                    ctx_param_name,
+                    kind=inspect.Parameter.KEYWORD_ONLY,
+                    annotation=_Ctx,
+                )
+                signature_params = params + [ctx_param]
+            else:
+                signature_params = params
+
             _wrapper.__signature__ = inspect.Signature(
-                parameters=params + [ctx_param], return_annotation=return_ann
+                parameters=signature_params, return_annotation=return_ann
             )
 
             def _make_adapter(context_param_name: str, inner_wrapper):
@@ -1601,7 +2635,11 @@ def create_declared_function_tools(mcp: FastMCP, server_context: ServerContext):
             mcp.add_tool(
                 _adapter,
                 name=name_local,
+                title=title,
                 description=description or (fn.__doc__ or ""),
+                annotations=annotations,
+                icons=icons,
+                meta=meta,
                 structured_output=structured_output,
             )
             registered.add(name_local)
@@ -1612,21 +2650,37 @@ def create_declared_function_tools(mcp: FastMCP, server_context: ServerContext):
 
             if run_tool_name not in registered:
                 # Build a wrapper mirroring original function params (excluding app_ctx/ctx)
-                async def _async_wrapper(**kwargs):
-                    ctx: MCPContext = kwargs.pop("__context__")
-                    # Start workflow and return workflow_id/run_id (do not wait)
-                    return await _workflow_run(ctx, wname_local, kwargs)
+                def _make_async_wrapper(bound_wname: str):
+                    async def _async_wrapper(**kwargs):
+                        ctx: MCPContext = kwargs.pop("__context__")
+                        bound_ctx, token = _enter_request_context(ctx)
+                        try:
+                            return await _workflow_run(
+                                ctx,
+                                bound_wname,
+                                kwargs,
+                                bound_context=bound_ctx,
+                            )
+                        finally:
+                            _exit_request_context(bound_ctx, token)
+
+                    return _async_wrapper
+
+                _async_wrapper = _make_async_wrapper(wname_local)
 
                 # Mirror original signature and annotations similar to sync path
                 ann = dict(getattr(fn, "__annotations__", {}))
                 ann.pop("app_ctx", None)
-                try:
-                    from mcp.server.fastmcp import Context as _Ctx
-                except Exception:
-                    _Ctx = None  # type: ignore
 
-                # Choose context kw-only parameter
-                ctx_param_name = "ctx"
+                try:
+                    sig_async = inspect.signature(fn)
+                except Exception:
+                    sig_async = None
+                existing_ctx_param = (
+                    _detect_context_param(sig_async) if sig_async else None
+                )
+
+                ctx_param_name = existing_ctx_param or "ctx"
                 if _Ctx is not None:
                     ann[ctx_param_name] = _Ctx
 
@@ -1650,38 +2704,36 @@ def create_declared_function_tools(mcp: FastMCP, server_context: ServerContext):
 
                 # Build mirrored signature: drop app_ctx and any FastMCP Context params
                 params = []
-                try:
-                    sig_async = inspect.signature(fn)
+                if sig_async is not None:
                     for p in sig_async.parameters.values():
                         if p.name == "app_ctx":
                             continue
-                        if p.name in ("ctx", "context"):
-                            continue
-                        if (
-                            _Ctx is not None
-                            and p.annotation is not inspect._empty
-                            and p.annotation is _Ctx
+                        if existing_ctx_param is None and (
+                            _annotation_is_fast_ctx(p.annotation)
+                            or p.name in ("ctx", "context")
                         ):
                             continue
                         params.append(p)
-                except Exception:
-                    params = []
 
                 # Append kw-only context param
-                if _Ctx is not None:
-                    ctx_param = inspect.Parameter(
-                        ctx_param_name,
-                        kind=inspect.Parameter.KEYWORD_ONLY,
-                        annotation=_Ctx,
-                    )
+                if existing_ctx_param is None:
+                    if _Ctx is not None:
+                        ctx_param = inspect.Parameter(
+                            ctx_param_name,
+                            kind=inspect.Parameter.KEYWORD_ONLY,
+                            annotation=_Ctx,
+                        )
+                    else:
+                        ctx_param = inspect.Parameter(
+                            ctx_param_name,
+                            kind=inspect.Parameter.KEYWORD_ONLY,
+                        )
+                    signature_params = params + [ctx_param]
                 else:
-                    ctx_param = inspect.Parameter(
-                        ctx_param_name,
-                        kind=inspect.Parameter.KEYWORD_ONLY,
-                    )
+                    signature_params = params
 
                 _async_wrapper.__signature__ = inspect.Signature(
-                    parameters=params + [ctx_param], return_annotation=ann.get("return")
+                    parameters=signature_params, return_annotation=ann.get("return")
                 )
 
                 # Adapter to map injected FastMCP context kwarg without additional propagation
@@ -1704,7 +2756,11 @@ def create_declared_function_tools(mcp: FastMCP, server_context: ServerContext):
                 mcp.add_tool(
                     _async_adapter,
                     name=run_tool_name,
+                    title=title,
                     description=full_desc,
+                    annotations=annotations,
+                    icons=icons,
+                    meta=meta,
                     structured_output=False,
                 )
                 registered.add(run_tool_name)
@@ -1745,6 +2801,7 @@ def create_workflow_specific_tools(
 
     @mcp.tool(
         name=f"workflows-{workflow_name}-run",
+        icons=[phetch],
         description=f"""
         Run the '{workflow_name}' workflow and get a dict with workflow_id and run_id back.
         Workflow Description: {workflow_cls.__doc__}
@@ -1765,8 +2822,13 @@ def create_workflow_specific_tools(
         ctx: MCPContext,
         run_parameters: Dict[str, Any] | None = None,
     ) -> Dict[str, str]:
-        _set_upstream_from_request_ctx_if_available(ctx)
-        return await _workflow_run(ctx, workflow_name, run_parameters)
+        bound_ctx, token = _enter_request_context(ctx)
+        try:
+            return await _workflow_run(
+                ctx, workflow_name, run_parameters, bound_context=bound_ctx
+            )
+        finally:
+            _exit_request_context(bound_ctx, token)
 
 
 # endregion
@@ -1818,6 +2880,8 @@ async def _workflow_run(
     ctx: MCPContext,
     workflow_name: str,
     run_parameters: Dict[str, Any] | None = None,
+    *,
+    bound_context: Optional["Context"] = None,
     **kwargs: Any,
 ) -> Dict[str, str]:
     # Use Temporal run_id as the routing key for gateway callbacks.
@@ -1825,9 +2889,44 @@ async def _workflow_run(
 
     # Resolve workflows and app context irrespective of startup mode
     # This now returns a context with upstream_session already set
-    workflows_dict, app_context = _resolve_workflows_and_context(ctx)
+    workflows_dict, app_context = _resolve_workflows_and_context_safe(
+        ctx, bound_context
+    )
     if not workflows_dict or not app_context:
         raise ToolError("Server context not available for MCPApp Server.")
+
+    # Bind the app context to this FastMCP request so request-scoped methods
+    # (client_id, request_id, log/progress/resource reads) work seamlessly.
+    bound_app_context = bound_context or app_context
+    if bound_app_context is None:
+        raise ToolError("Unable to resolve request context for workflow execution.")
+
+    if bound_context is None:
+        try:
+            request_ctx = getattr(ctx, "request_context", None)
+        except Exception:
+            request_ctx = None
+        if request_ctx is not None and hasattr(app_context, "bind_request"):
+            try:
+                bound_app_context = app_context.bind_request(
+                    request_ctx,
+                    getattr(ctx, "fastmcp", None),
+                )
+                if (
+                    getattr(bound_app_context, "upstream_session", None) is None
+                    and getattr(app_context, "upstream_session", None) is not None
+                ):
+                    bound_app_context.upstream_session = app_context.upstream_session
+            except Exception:
+                bound_app_context = app_context
+        else:
+            bound_app_context = app_context
+
+    # Expose the per-request bound context on the FastMCP context for adapters
+    try:
+        object.__setattr__(ctx, "bound_app_context", bound_app_context)
+    except Exception:
+        pass
 
     if workflow_name not in workflows_dict:
         raise ToolError(f"Workflow '{workflow_name}' not found.")
@@ -1842,14 +2941,20 @@ async def _workflow_run(
         if app is not None and getattr(app, "name", None):
             from mcp_agent.logging.logger import get_logger as _get_logger
 
-            _get_logger(f"mcp_agent.{app.name}", context=app_context)
+            _get_logger(f"mcp_agent.{app.name}", context=bound_app_context)
     except Exception:
         pass
 
     # Create and initialize the workflow instance using the factory method
     try:
         # Create workflow instance with context that has upstream_session
-        workflow = await workflow_cls.create(name=workflow_name, context=app_context)
+        workflow = await workflow_cls.create(
+            name=workflow_name, context=bound_app_context
+        )
+        try:
+            setattr(workflow, "_mcp_request_context", ctx)
+        except Exception:
+            pass
 
         run_parameters = run_parameters or {}
 
@@ -1968,10 +3073,14 @@ async def _workflow_run(
 
         # Register upstream session for this run so external workers can proxy logs/prompts
         try:
+            identity = _resolve_identity_for_request(ctx, app_context, execution_id)
             await _register_session(
                 run_id=execution.run_id,
                 execution_id=execution_id,
                 session=getattr(ctx, "session", None),
+                identity=identity,
+                context=bound_app_context,
+                session_id=getattr(bound_app_context, "request_session_id", None),
             )
         except Exception:
             pass
@@ -1988,14 +3097,12 @@ async def _workflow_run(
 
 
 async def _workflow_status(
-    ctx: MCPContext, run_id: str | None = None, workflow_id: str | None = None
+    ctx: MCPContext,
+    run_id: str | None = None,
+    workflow_id: str | None = None,
+    *,
+    bound_context: Optional["Context"] = None,
 ) -> Dict[str, Any]:
-    # Ensure upstream session so status-related logs are forwarded
-    try:
-        _set_upstream_from_request_ctx_if_available(ctx)
-    except Exception:
-        pass
-
     if not (run_id or workflow_id):
         raise ValueError("Either run_id or workflow_id must be provided.")
 
@@ -2030,3 +3137,12 @@ async def _workflow_status(
 
 
 # endregion
+
+
+def _parse_callback_params(url: str) -> Dict[str, str]:
+    parsed = urlparse(url)
+    params = {}
+    params.update({k: v[-1] for k, v in parse_qs(parsed.query).items()})
+    if parsed.fragment:
+        params.update({k: v[-1] for k, v in parse_qs(parsed.fragment).items()})
+    return params

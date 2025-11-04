@@ -7,12 +7,14 @@ import sys
 from httpx import URL
 from io import StringIO
 from pathlib import Path
-from typing import Annotated, Any, Dict, List, Literal, Optional, Set, Union
+from typing import Any, Dict, List, Literal, Optional, Set, Union
+from datetime import timedelta
 import threading
 import warnings
 
 from pydantic import (
     AliasChoices,
+    AnyHttpUrl,
     BaseModel,
     ConfigDict,
     Field,
@@ -25,10 +27,163 @@ import yaml
 from mcp_agent.agents.agent_spec import AgentSpec
 
 
+class MCPAuthorizationServerSettings(BaseModel):
+    """Configuration for exposing the MCP Agent server as an OAuth protected resource."""
+
+    enabled: bool = False
+    """Whether to expose this MCP app as an OAuth-protected resource server."""
+
+    issuer_url: AnyHttpUrl | None = None
+    """Issuer URL advertised to clients (must resolve to provider metadata)."""
+
+    resource_server_url: AnyHttpUrl | None = None
+    """Base URL of the protected resource (used for discovery and validation)."""
+
+    service_documentation_url: AnyHttpUrl | None = None
+    """Optional URL pointing to resource server documentation for clients."""
+
+    required_scopes: List[str] = Field(default_factory=list)
+    """Scopes that clients must present when accessing this resource."""
+
+    jwks_uri: AnyHttpUrl | None = None
+    """Optional JWKS endpoint for validating JWT access tokens."""
+
+    client_id: str | None = None
+    """Client id to use when calling the introspection endpoint."""
+
+    client_secret: str | None = None
+    """Client secret to use when calling the introspection endpoint."""
+
+    token_cache_ttl_seconds: int = Field(300, ge=0)
+    """How long (in seconds) to cache positive introspection/JWT validation results."""
+
+    # RFC 9068 audience validation settings
+    # TODO: this should really depend on the app_id, or config_id so that we can enforce unique values.
+    # To be removed and replaced with a fixed value once we have app_id/config_id support
+    expected_audiences: List[str] = Field(default_factory=list)
+    """List of audience values this resource server accepts.
+    MUST be configured to comply with RFC 9068 audience validation.
+    Audience validation is always enforced when authorization is enabled."""
+
+    model_config = ConfigDict(extra="allow", arbitrary_types_allowed=True)
+
+    @model_validator(mode="after")
+    def _validate_required_urls(self) -> "MCPAuthorizationServerSettings":
+        if self.enabled:
+            missing = []
+            if self.issuer_url is None:
+                missing.append("issuer_url")
+            if self.resource_server_url is None:
+                missing.append("resource_server_url")
+            # Validate audience configuration for RFC 9068 compliance
+            if not self.expected_audiences:
+                missing.append("expected_audiences (required for RFC 9068 compliance)")
+            if missing:
+                raise ValueError(
+                    " | ".join(missing) + " must be set when authorization is enabled"
+                )
+        return self
+
+
+class MCPOAuthClientSettings(BaseModel):
+    """Configuration for authenticating to downstream OAuth-protected MCP servers."""
+
+    enabled: bool = False
+    """Whether OAuth auth is enabled for this downstream server."""
+
+    scopes: List[str] = Field(default_factory=list)
+    """OAuth scopes to request when authorizing."""
+
+    resource: AnyHttpUrl | None = None
+    """Protected resource identifier to include in token/authorize requests (RFC 8707)."""
+
+    authorization_server: AnyHttpUrl | None = None
+    """Authorization server base URL (provider metadata is discovered from this root)."""
+
+    client_id: str | None = None
+    """OAuth client identifier registered with the authorization server."""
+
+    client_secret: str | None = None
+    """OAuth client secret for confidential clients."""
+
+    # Support for pre-configured access tokens (bypasses OAuth flow)
+    access_token: str | None = None
+    """Optional pre-seeded access token that bypasses the interactive flow."""
+
+    refresh_token: str | None = None
+    """Optional refresh token stored alongside a pre-seeded access token."""
+
+    expires_at: float | None = None
+    """Epoch timestamp (seconds) when the pre-seeded token expires."""
+
+    token_type: str = "Bearer"
+    """Token type returned by the provider; defaults to Bearer."""
+
+    redirect_uri_options: List[str] = Field(default_factory=list)
+    """Allowed redirect URI values; the flow selects from this list."""
+
+    extra_authorize_params: Dict[str, str] = Field(default_factory=dict)
+    """Additional query parameters to append to the authorize request."""
+
+    extra_token_params: Dict[str, str] = Field(default_factory=dict)
+    """Additional form parameters to append to the token request."""
+
+    require_pkce: bool = True
+    """Whether to enforce PKCE when initiating the authorization code flow."""
+
+    use_internal_callback: bool = True
+    """When true, attempt to use the app's internal callback URL before loopback."""
+
+    include_resource_parameter: bool = True
+    """Whether to include the RFC 8707 `resource` parameter in authorize/token requests."""
+
+    model_config = ConfigDict(extra="allow", arbitrary_types_allowed=True)
+
+
+class OAuthTokenStoreSettings(BaseModel):
+    """Settings for OAuth token persistence."""
+
+    backend: Literal["memory", "redis"] = "memory"
+    """Persistence backend to use for storing tokens."""
+
+    redis_url: str | None = None
+    """Connection URL for Redis when using the redis backend."""
+
+    redis_prefix: str = "mcp_agent:oauth_tokens"
+    """Key prefix used when writing tokens to Redis."""
+
+    refresh_leeway_seconds: int = Field(60, ge=0)
+    """Seconds before expiry when tokens should be refreshed."""
+
+    model_config = ConfigDict(extra="allow", arbitrary_types_allowed=True)
+
+
+class OAuthSettings(BaseModel):
+    """Global OAuth-related settings for MCP Agent."""
+
+    token_store: OAuthTokenStoreSettings = Field(
+        default_factory=OAuthTokenStoreSettings
+    )
+    """Token storage configuration shared across downstream servers."""
+
+    flow_timeout_seconds: int = Field(300, ge=30)
+    """Maximum number of seconds to wait for an authorization callback before timing out."""
+
+    callback_base_url: AnyHttpUrl | None = None
+    """Base URL for internal callbacks (used when `use_internal_callback` is true)."""
+
+    # Fixed loopback ports to try (client-only OAuth). If empty, loopback is disabled.
+    loopback_ports: list[int] = Field(default_factory=lambda: [33418, 33419, 33420])
+    """Ports to use for local loopback callbacks when internal callbacks are unavailable."""
+
+    model_config = ConfigDict(extra="allow", arbitrary_types_allowed=True)
+
+
 class MCPServerAuthSettings(BaseModel):
     """Represents authentication configuration for a server."""
 
     api_key: str | None = None
+    oauth: MCPOAuthClientSettings | None = None
 
     model_config = ConfigDict(extra="allow", arbitrary_types_allowed=True)
 
@@ -77,6 +232,9 @@ class MCPServerSettings(BaseModel):
 
     args: List[str] = Field(default_factory=list)
     """The arguments for the server command in stdio mode."""
+
+    cwd: str | None = None
+    """The working directory to use when spawning the server process in stdio mode."""
 
     url: str | None = None
     """The URL for the server for SSE, Streamble HTTP or websocket transport."""
@@ -476,8 +634,61 @@ class TemporalSettings(BaseModel):
         "reject_duplicate",
         "terminate_if_running",
     ] = "allow_duplicate"
+    workflow_task_modules: List[str] = Field(default_factory=list)
+    """Additional module paths to import before creating a Temporal worker. Each should be importable."""
 
     model_config = ConfigDict(extra="allow", arbitrary_types_allowed=True)
+
+
+class WorkflowTaskRetryPolicy(BaseModel):
+    """
+    Declarative retry policy for workflow tasks / activities (mirrors Temporal RetryPolicy fields).
+    Durations can be specified either as seconds (number) or ISO8601 timedelta strings; both are
+    coerced to datetime.timedelta instances.
+    """
+
+    maximum_attempts: int | None = None
+    initial_interval: timedelta | float | str | None = None
+    backoff_coefficient: float | None = None
+    maximum_interval: timedelta | float | str | None = None
+    non_retryable_error_types: List[str] | None = None
+
+    model_config = ConfigDict(extra="forbid")
+
+    @field_validator("initial_interval", "maximum_interval", mode="before")
+    @classmethod
+    def _coerce_interval(cls, value):
+        if value is None:
+            return None
+        if isinstance(value, timedelta):
+            return value
+        if isinstance(value, (int, float)):
+            return timedelta(seconds=value)
+        if isinstance(value, str):
+            try:
+                seconds = float(value)
+                return timedelta(seconds=seconds)
+            except Exception:
+                raise TypeError(
+                    "Retry interval strings must be parseable as seconds."
+                ) from None
+        raise TypeError(
+            "Retry interval must be seconds (number or string) or a timedelta."
+        )
+
+    def to_temporal_kwargs(self) -> Dict[str, Any]:
+        data: Dict[str, Any] = {}
+        if self.maximum_attempts is not None:
+            data["maximum_attempts"] = self.maximum_attempts
+        if self.initial_interval is not None:
+            data["initial_interval"] = self.initial_interval
+        if self.backoff_coefficient is not None:
+            data["backoff_coefficient"] = self.backoff_coefficient
+        if self.maximum_interval is not None:
+            data["maximum_interval"] = self.maximum_interval
+        if self.non_retryable_error_types:
+            data["non_retryable_error_types"] = list(self.non_retryable_error_types)
+        return data
 
 
 class UsageTelemetrySettings(BaseModel):
@@ -535,41 +746,32 @@ class TraceOTLPSettings(BaseModel):
     model_config = ConfigDict(extra="allow", arbitrary_types_allowed=True)
 
 
-class OpenTelemetryExporterBase(BaseModel):
-    """
-    Base class for OpenTelemetry exporter configuration.
-
-    This is used as the discriminated base for exporter-specific configs.
-    """
-
-    type: Literal["console", "file", "otlp"]
+class ConsoleExporterSettings(BaseModel):
+    """Console exporter uses stdout; no extra settings required."""
 
     model_config = ConfigDict(extra="allow", arbitrary_types_allowed=True)
 
 
-class ConsoleExporterSettings(OpenTelemetryExporterBase):
-    type: Literal["console"] = "console"
+class FileExporterSettings(BaseModel):
+    """File exporter settings for writing traces to a file."""
 
-
-class FileExporterSettings(OpenTelemetryExporterBase):
-    type: Literal["file"] = "file"
     path: str | None = None
     path_settings: TracePathSettings | None = None
 
+    model_config = ConfigDict(extra="allow", arbitrary_types_allowed=True)
 
-class OTLPExporterSettings(OpenTelemetryExporterBase):
-    type: Literal["otlp"] = "otlp"
+
+class OTLPExporterSettings(BaseModel):
     endpoint: str | None = None
     headers: Dict[str, str] | None = None
 
+    model_config = ConfigDict(extra="allow", arbitrary_types_allowed=True)
 
-OpenTelemetryExporterSettings = Annotated[
-    Union[
-        ConsoleExporterSettings,
-        FileExporterSettings,
-        OTLPExporterSettings,
-    ],
-    Field(discriminator="type"),
+
+OpenTelemetryExporterSettings = Union[
+    ConsoleExporterSettings,
+    FileExporterSettings,
+    OTLPExporterSettings,
 ]
 
 
@@ -581,16 +783,30 @@ class OpenTelemetrySettings(BaseModel):
     enabled: bool = False
 
     exporters: List[
-        Union[Literal["console", "file", "otlp"], OpenTelemetryExporterSettings]
+        Union[
+            Literal["console", "file", "otlp"],
+            Dict[Literal["console"], ConsoleExporterSettings | Dict],
+            Dict[Literal["file"], FileExporterSettings | Dict],
+            Dict[Literal["otlp"], OTLPExporterSettings | Dict],
+            ConsoleExporterSettings,
+            FileExporterSettings,
+            OTLPExporterSettings,
+        ]
     ] = []
     """
-    Exporters to use (can enable multiple simultaneously). Each exporter has
-    its own typed configuration.
+    Exporters to use (can enable multiple simultaneously). Each exporter accepts
+    either a plain string name (e.g. "console") or a keyed mapping (e.g.
+    `{file: {path: "path/to/file"}}`).
 
-    Backward compatible: a YAML list of literal strings (e.g. ["console", "otlp"]) is
-    accepted and will be transformed, sourcing settings from legacy fields
-    like `otlp_settings`, `path` and `path_settings` if present.
-    """
+    Backward compatible:
+      - `exporters: ["console", "otlp"]`
+      - `exporters: [{type: "file", path: "/tmp/out"}]`
+    Schema:
+      - `exporters: [console: {}, file: {path: "trace.jsonl"}, otlp: {endpoint: "https://..."}]`
+      - `exporters: ["console", {file: {path: "trace.jsonl"}}]`
+
+    Strings fall back to legacy fields like `otlp_settings`, `path`, and
+    `path_settings` when no explicit config is present"""
 
     service_name: str = "mcp-agent"
     service_instance_id: str | None = None
@@ -599,128 +815,202 @@ class OpenTelemetrySettings(BaseModel):
     sample_rate: float = 1.0
     """Sample rate for tracing (1.0 = sample everything)"""
 
-    # Deprecated: use exporters: [{ type: "otlp", ... }]
-    otlp_settings: TraceOTLPSettings | None = None
-    """Deprecated single OTLP settings. Prefer exporters list with type "otlp"."""
-
     model_config = ConfigDict(extra="allow", arbitrary_types_allowed=True)
 
     @model_validator(mode="before")
     @classmethod
     def _coerce_exporters_schema(cls, data: Dict) -> Dict:
         """
-        Backward compatibility shim to allow:
-          - exporters: ["console", "file", "otlp"] with legacy per-exporter fields
-          - exporters already in discriminated-union form
+        Normalize exporter entries for backward compatibility.
+
+        This validator handles three exporter formats:
+        - String exporters like ["console", "file", "otlp"] with top-level legacy fields
+        - Type-discriminated format with 'type' field: [{type: "console"}, {type: "otlp", endpoint: "..."}]
+        - Key-discriminated format: [{console: {}}, {otlp: {endpoint: "..."}}]
+
+        Conversion logic:
+        - String exporters → Keep as-is, will be finalized in _finalize_exporters using legacy fields
+        - {type: "X", ...} → Convert to {X: {...}} by removing 'type' and using it as dict key
+        - {X: {...}} → Keep as-is (already in correct format)
         """
         if not isinstance(data, dict):
             return data
 
         exporters = data.get("exporters")
-
-        # If exporters are already objects with a 'type', leave as-is
-        if isinstance(exporters, list) and all(
-            isinstance(e, dict) and "type" in e for e in exporters
-        ):
+        if not isinstance(exporters, list):
             return data
 
-        # If exporters are literal strings, up-convert to typed configs
-        if isinstance(exporters, list) and all(isinstance(e, str) for e in exporters):
-            typed_exporters: List[Dict] = []
+        normalized: List[Union[str, Dict[str, Dict[str, object]]]] = []
 
-            # Legacy helpers (can arrive as dicts or BaseModel instances)
-            legacy_otlp = data.get("otlp_settings")
-            if isinstance(legacy_otlp, BaseModel):
-                legacy_otlp = legacy_otlp.model_dump(exclude_none=True)
-            elif not isinstance(legacy_otlp, dict):
-                legacy_otlp = {}
+        for entry in exporters:
+            # Plain string like "console" or "file"
+            # These will be expanded later using legacy fields (path, otlp_settings, etc.)
+            if isinstance(entry, str):
+                normalized.append(entry)
+                continue
 
-            legacy_path = data.get("path")
-            legacy_path_settings = data.get("path_settings")
-            if isinstance(legacy_path_settings, BaseModel):
-                legacy_path_settings = legacy_path_settings.model_dump(
-                    exclude_none=True
-                )
+            # Handle BaseModel instances passed directly (e.g., from tests or re-validation)
+            # If already a typed exporter settings instance, keep as-is (already finalized)
+            if isinstance(
+                entry,
+                (ConsoleExporterSettings, FileExporterSettings, OTLPExporterSettings),
+            ):
+                normalized.append(entry)
+                continue
 
-            for name in exporters:
-                if name == "console":
-                    typed_exporters.append({"type": "console"})
-                elif name == "file":
-                    typed_exporters.append(
-                        {
-                            "type": "file",
-                            "path": legacy_path,
-                            "path_settings": legacy_path_settings,
-                        }
-                    )
-                elif name == "otlp":
-                    typed_exporters.append(
-                        {
-                            "type": "otlp",
-                            "endpoint": (legacy_otlp or {}).get("endpoint"),
-                            "headers": (legacy_otlp or {}).get("headers"),
-                        }
-                    )
-                else:
-                    raise ValueError(
-                        f"Unsupported OpenTelemetry exporter '{name}'. "
-                        "Supported exporters: console, file, otlp."
-                    )
+            # Handle other BaseModel instances by converting to dict
+            if isinstance(entry, BaseModel):
+                entry = entry.model_dump(exclude_none=True)
+                # Fall through to dict processing below
 
-            # Overwrite with transformed list
-            data["exporters"] = typed_exporters
+            if isinstance(entry, dict):
+                # Type-discriminated format: Extract 'type' field and use it as the dict key
+                # Example: {type: "otlp", endpoint: "..."} → {otlp: {endpoint: "..."}}
+                if "type" in entry:
+                    entry = entry.copy()
+                    exporter_type = entry.pop("type")
+                    normalized.append({exporter_type: entry})
+                    continue
+
+                # Key-discriminated format: Single-key dict like {console: {}} or {otlp: {endpoint: "..."}}
+                if len(entry) == 1:
+                    normalized.append(entry)
+                    continue
+
+            raise ValueError(
+                "OpenTelemetry exporters must be strings, type-tagged dicts, or "
+                'keyed mappings (e.g. `- console`, `- {type: "file"}`, '
+                '`- {file: {path: "trace.jsonl"}}`).'
+            )
+
+        data["exporters"] = normalized
 
         return data
 
     @model_validator(mode="after")
+    @classmethod
     def _finalize_exporters(cls, values: "OpenTelemetrySettings"):
-        """Ensure exporters are instantiated as typed configs even if literals were provided."""
+        """
+        Convert exporter entries to key-discriminated dict format for serialization compatibility.
 
-        typed_exporters: List[OpenTelemetryExporterSettings] = []
+        This validator runs after Pydantic validation and:
+        1. Extracts legacy top-level fields (path, path_settings, otlp_settings) from the model
+        2. Converts string exporters and dict exporters to key-discriminated dict format
+        3. Falls back to legacy fields when string exporters don't provide explicit config
+        4. Removes legacy fields from the model to avoid leaking them in serialization
 
+        Output format is key-discriminated dicts (e.g., {console: {}}, {file: {path: "..."}}) to ensure
+        that re-serialization and re-validation works correctly.
+
+        Example conversions:
+        - "file" + path="trace.jsonl" → {file: {path: "trace.jsonl"}}
+        - "otlp" + otlp_settings={endpoint: "..."} → {otlp: {endpoint: "...", headers: ...}}
+        """
+
+        finalized_exporters: List[Dict[str, Dict[str, Any]]] = []
+
+        # Extract legacy top-level fields (captured via extra="allow" in model_config)
+        # These fields were previously defined at the top level of OpenTelemetrySettings
         legacy_path = getattr(values, "path", None)
         legacy_path_settings = getattr(values, "path_settings", None)
+
+        # Normalize legacy_path_settings to TracePathSettings if it's a dict or BaseModel
         if isinstance(legacy_path_settings, dict):
             legacy_path_settings = TracePathSettings.model_validate(
                 legacy_path_settings
             )
+        elif legacy_path_settings is not None and not isinstance(
+            legacy_path_settings, TracePathSettings
+        ):
+            legacy_path_settings = TracePathSettings.model_validate(
+                getattr(
+                    legacy_path_settings, "model_dump", lambda **_: legacy_path_settings
+                )()
+            )
+
+        # Extract legacy otlp_settings and normalize to dict
+        legacy_otlp = getattr(values, "otlp_settings", None)
+        if isinstance(legacy_otlp, BaseModel):
+            legacy_otlp = legacy_otlp.model_dump(exclude_none=True)
+        elif not isinstance(legacy_otlp, dict):
+            legacy_otlp = {}
 
         for exporter in values.exporters:
-            if isinstance(exporter, OpenTelemetryExporterBase):
-                typed_exporters.append(exporter)  # Already typed
+            # If already a typed BaseModel instance, convert to key-discriminated dict format
+            if isinstance(exporter, ConsoleExporterSettings):
+                console_dict = exporter.model_dump(exclude_none=True)
+                finalized_exporters.append({"console": console_dict})
+                continue
+            elif isinstance(exporter, FileExporterSettings):
+                file_dict = exporter.model_dump(exclude_none=True)
+                finalized_exporters.append({"file": file_dict})
+                continue
+            elif isinstance(exporter, OTLPExporterSettings):
+                otlp_dict = exporter.model_dump(exclude_none=True)
+                finalized_exporters.append({"otlp": otlp_dict})
                 continue
 
-            if exporter == "console":
-                typed_exporters.append(ConsoleExporterSettings())
-            elif exporter == "file":
-                typed_exporters.append(
-                    FileExporterSettings(
-                        path=legacy_path,
-                        path_settings=legacy_path_settings,
+            exporter_name: str | None = None
+            payload: Dict[str, object] = {}
+
+            if isinstance(exporter, str):
+                exporter_name = exporter
+            elif isinstance(exporter, dict):
+                if len(exporter) != 1:
+                    raise ValueError(
+                        "OpenTelemetry exporter mappings must have exactly one key"
                     )
+                exporter_name, payload = next(iter(exporter.items()))
+                if payload is None:
+                    payload = {}
+                elif isinstance(payload, BaseModel):
+                    payload = payload.model_dump(exclude_none=True)
+                elif not isinstance(payload, dict):
+                    raise ValueError(
+                        'Exporter configuration must be a dict. Example: `- file: {path: "trace.jsonl"}`'
+                    )
+            else:
+                raise TypeError(f"Unexpected exporter entry: {exporter!r}")
+
+            if exporter_name == "console":
+                console_settings = ConsoleExporterSettings.model_validate(payload or {})
+                finalized_exporters.append(
+                    {"console": console_settings.model_dump(exclude_none=True)}
                 )
-            elif exporter == "otlp":
-                endpoint = None
-                headers = None
-                if values.otlp_settings:
-                    endpoint = getattr(values.otlp_settings, "endpoint", None)
-                    headers = getattr(values.otlp_settings, "headers", None)
-                typed_exporters.append(
-                    OTLPExporterSettings(endpoint=endpoint, headers=headers)
+            elif exporter_name == "file":
+                file_payload = payload.copy()
+                file_payload.setdefault("path", legacy_path)
+                if (
+                    "path_settings" not in file_payload
+                    and legacy_path_settings is not None
+                ):
+                    file_payload["path_settings"] = legacy_path_settings
+                file_settings = FileExporterSettings.model_validate(file_payload)
+                finalized_exporters.append(
+                    {"file": file_settings.model_dump(exclude_none=True)}
                 )
-            else:  # pragma: no cover - safeguarded by pre-validator, but keep defensive path
+            elif exporter_name == "otlp":
+                otlp_payload = payload.copy()
+                otlp_payload.setdefault("endpoint", legacy_otlp.get("endpoint"))
+                otlp_payload.setdefault("headers", legacy_otlp.get("headers"))
+                otlp_settings = OTLPExporterSettings.model_validate(otlp_payload)
+                finalized_exporters.append(
+                    {"otlp": otlp_settings.model_dump(exclude_none=True)}
+                )
+            else:
                 raise ValueError(
-                    f"Unsupported OpenTelemetry exporter '{exporter}'. "
-                    "Supported exporters: console, file, otlp."
+                    f"Unsupported OpenTelemetry exporter '{exporter_name}'. Supported exporters: console, file, otlp."
                 )
 
-        values.exporters = typed_exporters
+        values.exporters = finalized_exporters
 
         # Remove legacy extras once we've consumed them to avoid leaking into dumps
         if hasattr(values, "path"):
             delattr(values, "path")
         if hasattr(values, "path_settings"):
             delattr(values, "path_settings")
+        if hasattr(values, "otlp_settings"):
+            delattr(values, "otlp_settings")
 
         return values
 
@@ -841,6 +1131,14 @@ class Settings(BaseSettings):
     openai: OpenAISettings | None = Field(default_factory=OpenAISettings)
     """Settings for using OpenAI models in the MCP Agent application"""
 
+    workflow_task_modules: List[str] = Field(default_factory=list)
+    """Optional list of modules to import at startup so workflow tasks register globally."""
+
+    workflow_task_retry_policies: Dict[str, WorkflowTaskRetryPolicy] = Field(
+        default_factory=dict
+    )
+    """Optional mapping of activity names (supports '*' and 'prefix*') to retry policies."""
+
     azure: AzureSettings | None = Field(default_factory=AzureSettings)
     """Settings for using Azure models in the MCP Agent application"""
 
@@ -858,6 +1156,12 @@ class Settings(BaseSettings):
 
     agents: SubagentSettings | None = SubagentSettings()
     """Settings for defining and loading subagents for the MCP Agent application"""
+
+    authorization: MCPAuthorizationServerSettings | None = None
+    """Settings for exposing this MCP application as an OAuth protected resource"""
+
+    oauth: OAuthSettings | None = Field(default_factory=OAuthSettings)
+    """Global OAuth client configuration (token store, delegated auth defaults)"""
 
     def __eq__(self, other):  # type: ignore[override]
         if not isinstance(other, Settings):
@@ -915,6 +1219,9 @@ class Settings(BaseSettings):
             pass
 
         return None
+
+
+Settings.model_rebuild()
 
 
 class PreloadSettings(BaseSettings):
@@ -993,16 +1300,39 @@ def get_settings(config_path: str | None = None, set_global: bool = True) -> Set
         Settings instance with loaded configuration.
     """
 
-    def deep_merge(base: dict, update: dict) -> dict:
-        """Recursively merge two dictionaries, preserving nested structures."""
+    def deep_merge(base: dict, update: dict, path: tuple = ()) -> dict:
+        """Recursively merge two dictionaries, preserving nested structures.
+
+        Special handling for 'exporters' lists under 'otel' key:
+        - Concatenates lists instead of replacing them
+        - Allows combining exporters from config and secrets files
+        """
         merged = base.copy()
         for key, value in update.items():
+            current_path = path + (key,)
             if (
                 key in merged
                 and isinstance(merged[key], dict)
                 and isinstance(value, dict)
             ):
-                merged[key] = deep_merge(merged[key], value)
+                merged[key] = deep_merge(merged[key], value, current_path)
+            elif (
+                key in merged
+                and isinstance(merged[key], list)
+                and isinstance(value, list)
+                and current_path
+                in {
+                    ("otel", "exporters"),
+                    ("workflow_task_modules",),
+                }
+            ):
+                # Concatenate list-based settings while preserving order and removing duplicates
+                combined = merged[key] + value
+                deduped = []
+                for item in combined:
+                    if not any(existing == item for existing in deduped):
+                        deduped.append(item)
+                merged[key] = deduped
             else:
                 merged[key] = value
         return merged

@@ -13,11 +13,7 @@ from typing import Callable, Dict, AsyncGenerator, Optional, TYPE_CHECKING
 
 from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
 from mcp import ClientSession
-from mcp.client.stdio import (
-    StdioServerParameters,
-    stdio_client,
-    get_default_environment,
-)
+from mcp.client.stdio import StdioServerParameters, get_default_environment
 from mcp.client.sse import sse_client
 from mcp.client.streamable_http import streamablehttp_client, MCP_SESSION_ID
 from mcp.client.websocket import websocket_client
@@ -32,11 +28,25 @@ from mcp_agent.config import (
 from mcp_agent.logging.logger import get_logger
 from mcp_agent.mcp.mcp_agent_client_session import MCPAgentClientSession
 from mcp_agent.mcp.mcp_connection_manager import MCPConnectionManager
+from mcp_agent.mcp.stdio_transport import filtered_stdio_client
+from mcp_agent.oauth.http import OAuthHttpxAuth
 
 if TYPE_CHECKING:
     from mcp_agent.core.context import Context
 
 logger = get_logger(__name__)
+
+
+def _resolve_identity_from_context():
+    try:
+        from mcp_agent.server import (
+            app_server,
+        )  # local import to avoid circular dependency
+
+        return app_server.get_current_identity()
+    except Exception:
+        return None
+
 
 InitHookCallable = Callable[[ClientSession | None, MCPServerAuthSettings | None], bool]
 """
@@ -153,9 +163,12 @@ class ServerRegistry:
                 command=config.command,
                 args=config.args or [],
                 env={**get_default_environment(), **(config.env or {})},
+                cwd=config.cwd or None,
             )
 
-            async with stdio_client(server_params) as (read_stream, write_stream):
+            async with filtered_stdio_client(
+                server_name=server_name, server=server_params
+            ) as (read_stream, write_stream):
                 # Construct session; tolerate factories that don't accept 'context'
                 try:
                     session = client_session_factory(
@@ -215,6 +228,25 @@ class ServerRegistry:
                 kwargs["sse_read_timeout"] = sse_read_timeout
 
             # For Streamable HTTP, we get an additional callback for session ID
+            auth_handler = None
+            oauth_cfg = config.auth.oauth if config.auth else None
+            if oauth_cfg and oauth_cfg.enabled:
+                if context is None or getattr(context, "token_manager", None) is None:
+                    logger.warning(
+                        f"{server_name}: OAuth configured but token manager not available; skipping auth"
+                    )
+                else:
+                    auth_handler = OAuthHttpxAuth(
+                        token_manager=context.token_manager,
+                        context=context,
+                        server_name=server_name,
+                        server_config=config,
+                        scopes=oauth_cfg.scopes,
+                        identity_resolver=_resolve_identity_from_context,
+                    )
+            if auth_handler:
+                kwargs["auth"] = auth_handler
+
             async with streamablehttp_client(
                 **kwargs,
             ) as (read_stream, write_stream, session_id_callback):

@@ -3,10 +3,12 @@ import os
 import sys
 import functools
 
-from types import MethodType
+from types import MethodType, FunctionType
 from typing import (
     Any,
     Dict,
+    Iterable,
+    Mapping,
     Optional,
     Type,
     TypeVar,
@@ -20,6 +22,7 @@ from contextlib import asynccontextmanager
 
 from mcp import ServerSession
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations, Icon
 from mcp_agent.core.context import Context, initialize_context, cleanup_context
 from mcp_agent.config import Settings, get_settings
 from mcp_agent.executor.signal_registry import SignalRegistry
@@ -40,6 +43,8 @@ from mcp_agent.server.tool_adapter import validate_tool_schema
 from mcp_agent.tracing.telemetry import get_tracer
 from mcp_agent.utils.common import unwrap
 from mcp_agent.workflows.llm.llm_selector import ModelSelector
+from mcp_agent.oauth.manager import TokenManager
+from mcp_agent.oauth.store import InMemoryTokenStore
 from mcp_agent.workflows.factory import load_agent_specs_from_dir
 
 
@@ -49,6 +54,12 @@ if TYPE_CHECKING:
 
 P = ParamSpec("P")
 R = TypeVar("R")
+
+phetch = Icon(
+    src="https://s3.us-east-1.amazonaws.com/publicdata.lastmileai.com/phetch.png",
+    mimeType="image/png",
+    sizes=["48x48"],
+)
 
 
 class MCPApp:
@@ -83,6 +94,8 @@ class MCPApp:
         signal_notification: SignalWaitCallback | None = None,
         upstream_session: Optional["ServerSession"] = None,
         model_selector: ModelSelector | None = None,
+        icons: list[Icon] | None = None,
+        session_id: str | None = None,
     ):
         """
         Initialize the application with a name and optional settings.
@@ -133,6 +146,11 @@ class MCPApp:
         self._signal_notification = signal_notification
         self._upstream_session = upstream_session
         self._model_selector = model_selector
+        if icons:
+            self._icons = icons
+        else:
+            self._icons = [phetch]
+        self._session_id_override = session_id
 
         self._workflows: Dict[str, Type["Workflow"]] = {}  # id to workflow class
         # Deferred tool declarations to register with MCP server when available
@@ -237,6 +255,7 @@ class MCPApp:
             decorator_registry=self._decorator_registry,
             signal_registry=self._signal_registry,
             store_globally=True,
+            session_id=self._session_id_override,
         )
 
         # Store the app-specific tracer provider
@@ -252,6 +271,54 @@ class MCPApp:
 
         # Store a reference to this app instance in the context for easier access
         self._context.app = self
+
+        # Initialize OAuth token management helpers if configured
+        oauth_settings = None
+        try:
+            if self._context.config:
+                oauth_settings = self._context.config.oauth
+        except Exception:
+            oauth_settings = None
+
+        if oauth_settings:
+            self.logger.debug("Initializing OAuth token management")
+            backend = (
+                oauth_settings.token_store.backend
+                if oauth_settings.token_store
+                else "memory"
+            )
+            if backend == "redis":
+                from mcp_agent.oauth.store import RedisTokenStore
+
+                if RedisTokenStore is None:
+                    raise ImportError(
+                        "Redis token store requires the 'redis' optional dependency. "
+                        "Install with `pip install mcp-agent[redis]`."
+                    )
+
+                redis_url = oauth_settings.token_store.redis_url
+                if not redis_url:
+                    raise ValueError(
+                        "redis_url must be configured when using the Redis token store"
+                    )
+                token_store = RedisTokenStore(
+                    url=redis_url,
+                    prefix=oauth_settings.token_store.redis_prefix,
+                )
+            else:
+                token_store = InMemoryTokenStore()
+
+            token_manager = TokenManager(
+                token_store=token_store,
+                settings=oauth_settings,
+            )
+            self._context.token_store = token_store
+            self._context.token_manager = token_manager
+
+            # Check for pre-configured tokens and store them with synthetic users
+            await self._initialize_preconfigured_tokens(token_manager)
+        else:
+            self.logger.debug("No OAuth settings found, skipping OAuth initialization")
 
         # Provide a safe default bound context for loggers created after init without explicit context
         try:
@@ -329,6 +396,52 @@ class MCPApp:
                 "session_id": self.session_id,
             },
         )
+
+    async def _initialize_preconfigured_tokens(self, token_manager):
+        """Check for pre-configured OAuth tokens and store them with a single synthetic user."""
+
+        mcp_config = getattr(self._context.config, "mcp", None)
+        if not mcp_config or not getattr(mcp_config, "servers", None):
+            self.logger.debug(
+                "No MCP servers found in config, skipping token initialization"
+            )
+            return
+
+        servers = mcp_config.servers
+        self.logger.debug(f"Found MCP servers in config: {list(servers.keys())}")
+
+        servers_with_tokens = []
+
+        # First pass: check which servers have pre-configured tokens
+        for server_name, server_config in servers.items():
+            if not hasattr(server_config, "auth") or not server_config.auth:
+                self.logger.debug(
+                    f"Server '{server_name}' has no auth config, skipping"
+                )
+                continue
+
+            oauth_config = getattr(server_config.auth, "oauth", None)
+
+            if (
+                not oauth_config
+                or not oauth_config.enabled
+                or not oauth_config.access_token
+            ):
+                continue
+
+            self.logger.debug(f"Server '{server_name}' has pre-configured OAuth token")
+            servers_with_tokens.append((server_name, server_config))
+
+        if servers_with_tokens:
+            for server_name, server_config in servers_with_tokens:
+                self.logger.info(
+                    "Storing pre-configured OAuth token for server: %s", server_name
+                )
+                await token_manager.store_preconfigured_token(
+                    context=self._context,
+                    server_name=server_name,
+                    server_config=server_config,
+                )
 
     async def get_token_node(self):
         """Return the root app token node, if available."""
@@ -561,6 +674,25 @@ class MCPApp:
             # Fall back to the original function
             return await fn(*args, **kwargs)
 
+        # Ensure the wrapper shares the original function's globals so that
+        # string annotations (from __future__ import annotations) continue to
+        # resolve against the workflow module rather than mcp_agent.app.
+        original_globals = getattr(fn, "__globals__", None)
+        if original_globals is not None and wrapper.__globals__ is not original_globals:
+            rebuilt_wrapper = FunctionType(
+                wrapper.__code__,
+                original_globals,
+                name=wrapper.__name__,
+                argdefs=wrapper.__defaults__,
+                closure=wrapper.__closure__,
+            )
+            rebuilt_wrapper.__kwdefaults__ = wrapper.__kwdefaults__
+            rebuilt_wrapper.__annotations__ = wrapper.__annotations__
+            rebuilt_wrapper.__dict__.update(wrapper.__dict__)
+            rebuilt_wrapper = functools.update_wrapper(rebuilt_wrapper, fn)
+            rebuilt_wrapper.__wrapped__ = fn
+            wrapper = rebuilt_wrapper
+
         return wrapper
 
     def _create_workflow_from_function(
@@ -586,6 +718,7 @@ class MCPApp:
         async def _invoke_target(workflow_self, *args, **kwargs):
             # Inject app_ctx (AppContext) and shim ctx (FastMCP Context) if requested by the function
             import inspect as _inspect
+            import typing as _typing
 
             call_kwargs = dict(kwargs)
 
@@ -622,24 +755,64 @@ class MCPApp:
             except Exception:
                 pass
 
-            # If the function expects a FastMCP Context (ctx/context), ensure it's present (None inside workflow)
+            # If the function expects a FastMCP Context (ctx/context), ensure it's present.
             try:
                 from mcp.server.fastmcp import Context as _Ctx  # type: ignore
             except Exception:
                 _Ctx = None  # type: ignore
 
+            def _is_fast_ctx_annotation(annotation) -> bool:
+                if _Ctx is None or annotation is _inspect._empty:
+                    return False
+                if annotation is _Ctx:
+                    return True
+                if _inspect.isclass(annotation):
+                    try:
+                        if issubclass(annotation, _Ctx):  # type: ignore[misc]
+                            return True
+                    except TypeError:
+                        pass
+                try:
+                    origin = _typing.get_origin(annotation)
+                    if origin is not None:
+                        return any(
+                            _is_fast_ctx_annotation(arg)
+                            for arg in _typing.get_args(annotation)
+                        )
+                except Exception:
+                    pass
+                try:
+                    return "fastmcp" in str(annotation)
+                except Exception:
+                    return False
+
             try:
                 sig = sig if "sig" in locals() else _inspect.signature(fn)
                 for p in sig.parameters.values():
-                    if (
-                        p.annotation is not _inspect._empty
-                        and _Ctx is not None
-                        and p.annotation is _Ctx
+                    needs_fast_ctx = False
+                    if _is_fast_ctx_annotation(p.annotation):
+                        needs_fast_ctx = True
+                    elif p.annotation is _inspect._empty and p.name in (
+                        "ctx",
+                        "context",
                     ):
-                        if p.name not in call_kwargs:
-                            call_kwargs[p.name] = None
-                    if p.name in ("ctx", "context") and p.name not in call_kwargs:
-                        call_kwargs[p.name] = None
+                        needs_fast_ctx = True
+                    if needs_fast_ctx and p.name not in call_kwargs:
+                        fast_ctx = getattr(workflow_self, "_mcp_request_context", None)
+                        if fast_ctx is None and app_context_param_name:
+                            _app_ctx = call_kwargs.get(app_context_param_name, None)
+                            if _Ctx is not None and isinstance(_app_ctx, _Ctx):
+                                fast_ctx = _app_ctx
+                            _fastmcp = getattr(_app_ctx, "fastmcp", None)
+                            if _fastmcp is not None and hasattr(
+                                _fastmcp, "get_context"
+                            ):
+                                try:
+                                    fast_ctx = _fastmcp.get_context()
+                                except Exception:
+                                    fast_ctx = None
+                        if fast_ctx is not None:
+                            call_kwargs[p.name] = fast_ctx
             except Exception:
                 pass
 
@@ -739,7 +912,11 @@ class MCPApp:
         self,
         name: str | None = None,
         *,
+        title: str | None = None,
         description: str | None = None,
+        annotations: ToolAnnotations | Mapping[str, Any] | None = None,
+        icons: Iterable[Icon | Mapping[str, Any]] | None = None,
+        meta: Mapping[str, Any] | None = None,
         structured_output: bool | None = None,
     ) -> Callable[[Callable[P, R]], Callable[P, R]]: ...
 
@@ -747,7 +924,11 @@ class MCPApp:
         self,
         name: str | None = None,
         *,
+        title: str | None = None,
         description: str | None = None,
+        annotations: ToolAnnotations | Mapping[str, Any] | None = None,
+        icons: Iterable[Icon | Mapping[str, Any]] | None = None,
+        meta: Mapping[str, Any] | None = None,
         structured_output: bool | None = None,
     ):
         """
@@ -765,6 +946,30 @@ class MCPApp:
             # that the transformed function can be converted to JSON schema
 
             validate_tool_schema(fn, tool_name)
+
+            annotations_obj: ToolAnnotations | None = None
+            if annotations is not None:
+                if isinstance(annotations, ToolAnnotations):
+                    annotations_obj = annotations
+                else:
+                    annotations_obj = ToolAnnotations(**dict(annotations))
+
+            icons_list: list[Icon] | None = None
+            if icons is not None:
+                icons_list = []
+                for icon in icons:
+                    if isinstance(icon, Icon):
+                        icons_list.append(icon)
+                    elif isinstance(icon, Mapping):
+                        icons_list.append(Icon(**icon))
+                    else:
+                        raise TypeError("icons entries must be Icon or mapping")
+            else:
+                icons_list = [phetch]
+
+            meta_payload: Dict[str, Any] | None = None
+            if meta is not None:
+                meta_payload = dict(meta)
 
             # Construct the workflow from function
             workflow_cls = self._create_workflow_from_function(
@@ -784,13 +989,25 @@ class MCPApp:
                     "source_fn": fn,
                     "structured_output": structured_output,
                     "description": description or (fn.__doc__ or ""),
+                    "title": title,
+                    "annotations": annotations_obj,
+                    "icons": icons_list,
+                    "meta": meta_payload,
                 }
             )
 
             return fn
 
         # Support bare usage: @app.tool without parentheses
-        if callable(name) and description is None and structured_output is None:
+        if (
+            callable(name)
+            and title is None
+            and description is None
+            and annotations is None
+            and icons is None
+            and meta is None
+            and structured_output is None
+        ):
             _fn = name  # type: ignore[assignment]
             name = None
             return decorator(_fn)  # type: ignore[arg-type]
@@ -805,14 +1022,24 @@ class MCPApp:
         self,
         name: str | None = None,
         *,
+        title: str | None = None,
         description: str | None = None,
+        annotations: ToolAnnotations | Mapping[str, Any] | None = None,
+        icons: Iterable[Icon | Mapping[str, Any]] | None = None,
+        meta: Mapping[str, Any] | None = None,
+        structured_output: bool | None = None,
     ) -> Callable[[Callable[P, R]], Callable[P, R]]: ...
 
     def async_tool(
         self,
         name: str | None = None,
         *,
+        title: str | None = None,
         description: str | None = None,
+        annotations: ToolAnnotations | Mapping[str, Any] | None = None,
+        icons: Iterable[Icon | Mapping[str, Any]] | None = None,
+        meta: Mapping[str, Any] | None = None,
+        structured_output: bool | None = None,
     ):
         """
         Decorator to declare an asynchronous MCP tool.
@@ -830,12 +1057,37 @@ class MCPApp:
 
             validate_tool_schema(fn, workflow_name)
 
+            annotations_obj: ToolAnnotations | None = None
+            if annotations is not None:
+                if isinstance(annotations, ToolAnnotations):
+                    annotations_obj = annotations
+                else:
+                    annotations_obj = ToolAnnotations(**dict(annotations))
+
+            icons_list: list[Icon] | None = None
+            if icons is not None:
+                icons_list = []
+                for icon in icons:
+                    if isinstance(icon, Icon):
+                        icons_list.append(icon)
+                    elif isinstance(icon, Mapping):
+                        icons_list.append(Icon(**icon))
+                    else:
+                        raise TypeError("icons entries must be Icon or mapping")
+            else:
+                icons_list = [phetch]
+
+            meta_payload: Dict[str, Any] | None = None
+            if meta is not None:
+                meta_payload = dict(meta)
+
             workflow_cls = self._create_workflow_from_function(
                 fn,
                 workflow_name=workflow_name,
                 description=description,
                 mark_sync_tool=False,
             )
+
             # Defer alias tool registration for run/get_status
             self._declared_tools.append(
                 {
@@ -844,19 +1096,87 @@ class MCPApp:
                     "workflow_name": workflow_name,
                     "workflow_cls": workflow_cls,
                     "source_fn": fn,
-                    "structured_output": None,
+                    "structured_output": structured_output,
                     "description": description or (fn.__doc__ or ""),
+                    "title": title,
+                    "annotations": annotations_obj,
+                    "icons": icons_list,
+                    "meta": meta_payload,
                 }
             )
             return fn
 
         # Support bare usage: @app.async_tool without parentheses
-        if callable(name) and description is None:
+        if (
+            callable(name)
+            and title is None
+            and description is None
+            and annotations is None
+            and icons is None
+            and meta is None
+            and structured_output is None
+        ):
             _fn = name  # type: ignore[assignment]
             name = None
             return decorator(_fn)  # type: ignore[arg-type]
 
         return decorator
+
+    def _get_configured_retry_policy(self, activity_name: str) -> Dict[str, Any] | None:
+        """
+        Compute the retry policy override for a workflow task.
+
+        Matching precedence (highest first):
+        - Exact full activity name (e.g., ``package.module.task``)
+        - Dotted suffix match (``task`` or ``module.task``)
+        - Prefix wildcard (``package.*``), with longest prefix winning
+        - Global fallback (``*``)
+        """
+        overrides = getattr(self.config, "workflow_task_retry_policies", None)
+        if not overrides:
+            return None
+
+        def coerce(policy: Any) -> Dict[str, Any]:
+            if policy is None:
+                return {}
+            if hasattr(policy, "to_temporal_kwargs"):
+                return policy.to_temporal_kwargs()
+            return dict(policy)
+
+        best_match: tuple[int, int, Dict[str, Any]] | None = None
+
+        def record(priority: int, length: int, policy_dict: Dict[str, Any]):
+            nonlocal best_match
+            candidate = (priority, length, policy_dict)
+            if best_match is None or candidate > best_match:
+                best_match = candidate
+
+        for key, policy_obj in overrides.items():
+            policy_dict = coerce(policy_obj)
+            if not policy_dict:
+                continue
+
+            if key == "*":
+                record(0, 0, policy_dict)
+                continue
+
+            if key.endswith("*"):
+                prefix = key[:-1]
+                if activity_name.startswith(prefix):
+                    record(1, len(prefix), policy_dict)
+                continue
+
+            if "." in key:
+                if activity_name == key:
+                    record(3, len(key), policy_dict)
+                elif activity_name.endswith(f".{key}"):
+                    record(2, len(key), policy_dict)
+                continue
+
+            if activity_name.split(".")[-1] == key:
+                record(2, len(key), policy_dict)
+
+        return best_match[2] if best_match else None
 
     def workflow_task(
         self,
@@ -897,6 +1217,11 @@ class MCPApp:
                 "retry_policy": retry_policy or {},
                 **meta_kwargs,
             }
+
+            override_policy = self._get_configured_retry_policy(activity_name)
+            if override_policy:
+                existing_policy = metadata.get("retry_policy") or {}
+                metadata["retry_policy"] = {**existing_policy, **override_policy}
 
             # bookkeeping that survives partial/bound wrappers
             func.is_workflow_task = True
@@ -971,6 +1296,14 @@ class MCPApp:
                 )
                 self._registered_global_workflow_tasks.add(activity_name)
                 continue
+
+            override_policy = self._get_configured_retry_policy(activity_name)
+            if override_policy:
+                existing_policy = metadata.get("retry_policy") or {}
+                metadata["retry_policy"] = {**existing_policy, **override_policy}
+
+            func.is_workflow_task = True
+            func.execution_metadata = metadata
 
             # Apply the engine-specific decorator if available
             task_defn = self._decorator_registry.get_workflow_task_decorator(

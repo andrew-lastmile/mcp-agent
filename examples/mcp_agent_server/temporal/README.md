@@ -53,7 +53,7 @@ The MCP agent server exposes the following tools:
 
 - Python 3.10+
 - [UV](https://github.com/astral-sh/uv) package manager
-- API keys for Anthropic and OpenAI
+- API keys for OpenAI
 - Temporal server (see setup instructions below)
 
 ## Setting Up Temporal Server
@@ -107,12 +107,12 @@ The `mcp_agent.config.yaml` file contains paths to executables. For Claude Deskt
    ```
 
 2. Edit `mcp_agent.secrets.yaml` to add your API keys:
-   ```yaml
-   anthropic:
-     api_key: "your-anthropic-api-key"
-   openai:
-     api_key: "your-openai-api-key"
-   ```
+  ```yaml
+  openai:
+    api_key: "your-openai-api-key"
+  ```
+
+The included `mcp_agent.config.yaml` is wired for the local Temporal dev server. If you define extra `@workflow_task` functions in your own modules, uncomment the top-level `workflow_task_modules` list in that config and add your module paths so the worker pre-imports them when it starts.
 
 ## How to Run
 

@@ -9,10 +9,12 @@ The example showcases the durable execution capabilities of Temporal.
 """
 
 import asyncio
+import base64
 import logging
 import os
+from pathlib import Path
 
-from mcp.types import ModelHint, ModelPreferences, SamplingMessage, TextContent
+from mcp.types import Icon, ModelHint, ModelPreferences, SamplingMessage, TextContent
 from temporalio.exceptions import ApplicationError
 
 from mcp_agent.agents.agent import Agent
@@ -93,8 +95,25 @@ class BasicAgentWorkflow(Workflow[str]):
             return WorkflowResult(value=result)
 
 
-@app.tool
-async def finder_tool(request: str, app_ctx: Context | None = None) -> str:
+icon_file = Path(__file__).parent / "mag.png"
+icon_data = base64.standard_b64encode(icon_file.read_bytes()).decode()
+icon_data_uri = f"data:image/png;base64,{icon_data}"
+mag_icon = Icon(src=icon_data_uri, mimeType="image/png", sizes=["64x64"])
+
+
+@app.tool(
+    name="finder_tool",
+    title="Finder Tool",
+    description="Run the Finder workflow synchronously.",
+    annotations={"idempotentHint": False},
+    icons=[mag_icon],
+    meta={"category": "demo", "engine": "temporal"},
+    structured_output=False,
+)
+async def finder_tool(
+    request: str,
+    app_ctx: Context | None = None,
+) -> str:
     """
     Run the basic agent workflow using the app.tool decorator to set up the workflow.
     The code in this function is run in workflow context.
@@ -110,9 +129,8 @@ async def finder_tool(request: str, app_ctx: Context | None = None) -> str:
         To create this as an async tool, use @app.async_tool instead, which will return the workflow ID and run ID.
     """
 
-    app = app_ctx.app
-
-    logger = app.logger
+    context = app_ctx if app_ctx is not None else app.context
+    logger = context.logger
     logger.info("[workflow-mode] Running finder_tool", data={"input": request})
 
     finder_agent = Agent(
@@ -121,16 +139,17 @@ async def finder_tool(request: str, app_ctx: Context | None = None) -> str:
         server_names=["fetch", "filesystem"],
     )
 
-    context = app.context
     context.config.mcp.servers["filesystem"].args.extend([os.getcwd()])
 
     async with finder_agent:
         finder_llm = await finder_agent.attach_llm(OpenAIAugmentedLLM)
 
+        await context.report_progress(0.4, total=1.0, message="Invoking finder agent")
         result = await finder_llm.generate_str(
             message=request,
         )
         logger.info("[workflow-mode] finder_tool agent result", data={"result": result})
+        await context.report_progress(1.0, total=1.0, message="Finder completed")
 
     return result
 

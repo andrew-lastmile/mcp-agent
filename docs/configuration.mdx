@@ -40,7 +40,7 @@ mcp-agent uses two configuration files:
               args: ["-y", "@modelcontextprotocol/server-filesystem", "."]
 
         openai:
-          default_model: gpt-4o
+          default_model: gpt-5
         ```
       </Step>
 
@@ -102,7 +102,7 @@ mcp-agent uses two configuration files:
             ),
             openai=OpenAISettings(
                 api_key="your-openai-api-key",
-                default_model="gpt-4o",
+                default_model="gpt-5",
             ),
         )
         ```
@@ -122,6 +122,53 @@ mcp-agent uses two configuration files:
     </Note>
   </Tab>
 </Tabs>
+
+## OAuth Configuration
+
+MCP Agent exposes two complementary OAuth configuration blocks:
+
+- `authorization` describes how the MCP Agent server validates inbound bearer tokens and publishes protected resource metadata.
+- `oauth` configures delegated authorization when the agent connects to downstream MCP servers.
+
+```yaml
+authorization:
+  enabled: true
+  issuer_url: https://auth.example.com
+  resource_server_url: https://agent.example.com/mcp
+  required_scopes: ["mcp.read", "mcp.write"]
+  client_id: ${INTROSPECTION_CLIENT_ID}
+  client_secret: ${INTROSPECTION_CLIENT_SECRET}
+
+oauth:
+  callback_base_url: https://agent.example.com
+  flow_timeout_seconds: 180
+  token_store:
+    backend: memory   # set to "redis" for multi-instance deployments
+    refresh_leeway_seconds: 90
+    redis_url: redis://localhost:6379
+    redis_prefix: mcp_agent:oauth_tokens
+
+mcp:
+  servers:
+    github:
+      transport: streamable_http
+      url: https://github.mcp.example.com/mcp
+      auth:
+        oauth:
+          enabled: true
+          scopes: ["repo", "user:email"]
+          client_id: ${GITHUB_MCP_CLIENT_ID}
+          client_secret: ${GITHUB_MCP_CLIENT_SECRET}
+          include_resource_parameter: false  # disable RFC 8707 resource param for providers like GitHub
+          redirect_uri_options:
+            - https://agent.example.com/internal/oauth/callback
+```
+
+- When `authorization.enabled` is true the MCP server advertises `/.well-known/oauth-protected-resource` and enforces bearer tokens using the provided introspection or JWKS configuration.
+- `oauth` enables delegated authorization flows; the default in-memory token store is ideal for local development while Redis is recommended for production clusters.
+- To use Redis for token storage, configure `token_store.backend: redis` and supply `redis_url` (see optional dependency `mcp-agent[redis]`).
+- Downstream servers opt into OAuth via `mcp.servers.<name>.auth.oauth`. Supplying a `client_id`/`client_secret` allows immediate usage; support for dynamic client registration is planned as a follow-up.
+- Some providers (including GitHub) reject the RFC 8707 `resource` parameter. Set `include_resource_parameter: false` in the client settings for those services.
 
 ## Configuration Reference
 
@@ -268,7 +315,7 @@ mcp:
 <CodeGroup>
 ```yaml Config File
 openai:
-  default_model: gpt-4o
+  default_model: gpt-5
   max_tokens: 4096
   temperature: 0.7
 ```
@@ -688,7 +735,7 @@ Keep sensitive configuration in separate secrets files:
   </Tab>
   
   <Tab title="Cloud Secrets">
-    For mcp-agent cloud deployments, only raw secrets (not environment variables) are supported:
+    For Cloud deployments, only raw secrets (not environment variables) are supported currently:
     
     ```yaml
     openai:
@@ -851,7 +898,7 @@ mcp:
       args: ["mcp-server-fetch"]
 
 openai:
-  default_model: gpt-4o
+  default_model: gpt-5
   reasoning_effort: "medium"  # For o-series models: low, medium, high
   api_key: "${OPENAI_API_KEY}"
 ```
@@ -900,7 +947,7 @@ mcp:
 
 # Configure multiple providers
 openai:
-  default_model: gpt-4o
+  default_model: gpt-5
   api_key: "${OPENAI_API_KEY}"
 
 anthropic:
