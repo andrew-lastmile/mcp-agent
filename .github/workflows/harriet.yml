@@ -1,0 +1,84 @@
+name: Harriet Canary
+
+on:
+  schedule:
+    - cron: "0 * * * *"   # hourly (UTC)
+  workflow_dispatch:       # allow manual runs too
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hourly-mcp-test
+  cancel-in-progress: true
+
+jobs:
+  test-app:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      # Point tests at your always-on MCP server (set these in repo secrets)
+      MCP_SERVER_URL: ${{ secrets.MCP_SERVER_URL_ALT }}
+      MCP_SERVER_NAME: ${{ secrets.MCP_SERVER_NAME_ALT }}
+      PYTHONUNBUFFERED: "1"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+          pip install pytest
+
+      - name: Run only test_app.py
+        run: |
+          set -euo pipefail
+          if [ -f tests/test_app.py ]; then
+            pytest -q tests/test_app.py
+          elif [ -f test_app.py ]; then
+            pytest -q test_app.py
+          else
+            echo "Could not find test_app.py" >&2
+            exit 1
+          fi
+
+      # Distinct Slack message/payload for this hourly job
+      - name: Slack notify (Hourly MCP smoke test)
+        if: always()
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          STATUS: ${{ job.status }}
+          SERVER_NAME: ${{ env.MCP_SERVER_NAME }}
+        run: |
+          if [ "${STATUS}" = "success" ]; then EMOJI="✅"; COLOR="#2eb886"; else EMOJI="❌"; COLOR="#e01e5a"; fi
+          PAYLOAD=$(cat <<'JSON'
+          {
+            "text": "Hourly MCP smoke test",
+            "attachments": [
+              {
+                "color": "COLOR_HERE",
+                "blocks": [
+                  { "type": "section", "text": { "type": "mrkdwn", "text": "*MCP Hourly Smoke Test*: EMOJI *STATUS_HERE*" } },
+                  { "type": "section", "text": { "type": "mrkdwn", "text": "*Server*: SERVER_NAME_HERE" } },
+                  { "type": "context", "elements": [
+                    { "type": "mrkdwn", "text": "<${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}|View workflow run>" }
+                  ]}
+                ]
+              }
+            ]
+          }
+          JSON
+          )
+          PAYLOAD="${PAYLOAD//STATUS_HERE/${STATUS^^}}"
+          PAYLOAD="${PAYLOAD//SERVER_NAME_HERE/${SERVER_NAME:-unknown}}"
+          PAYLOAD="${PAYLOAD//COLOR_HERE/$COLOR}"
+          PAYLOAD="${PAYLOAD//EMOJI/$EMOJI}"
+          curl -X POST -H 'Content-type: application/json' --data "$PAYLOAD" "$DEV_SLACK_WEBHOOK_URL"
