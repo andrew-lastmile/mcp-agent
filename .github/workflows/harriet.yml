@@ -47,35 +47,41 @@ jobs:
             exit 1
           fi
 
-      # Distinct Slack message/payload for this hourly job
       - name: Slack notify (Hourly MCP smoke test)
         if: always()
         env:
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
           STATUS: ${{ job.status }}
           SERVER_NAME: ${{ env.MCP_SERVER_NAME }}
         run: |
-          if [ "${STATUS}" = "success" ]; then EMOJI="✅"; COLOR="#2eb886"; else EMOJI="❌"; COLOR="#e01e5a"; fi
-          PAYLOAD=$(cat <<'JSON'
+          set -euo pipefail
+      
+          # bail out quietly if the single chosen webhook isn't set
+          if [[ -z "${DEV_SLACK_WEBHOOK_URL:-}" ]]; then
+            echo "::notice::DEV_SLACK_WEBHOOK_URL is empty; skipping Slack notification."
+            exit 0
+          fi
+      
+          if [[ "${STATUS}" == "success" ]]; then EMOJI="✅"; COLOR="#2eb886"; else EMOJI="❌"; COLOR="#e01e5a"; fi
+      
+          read -r -d '' PAYLOAD <<'JSON'
           {
             "text": "Hourly MCP smoke test",
-            "attachments": [
-              {
-                "color": "COLOR_HERE",
-                "blocks": [
-                  { "type": "section", "text": { "type": "mrkdwn", "text": "*MCP Hourly Smoke Test*: EMOJI *STATUS_HERE*" } },
-                  { "type": "section", "text": { "type": "mrkdwn", "text": "*Server*: SERVER_NAME_HERE" } },
-                  { "type": "context", "elements": [
-                    { "type": "mrkdwn", "text": "<${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}|View workflow run>" }
-                  ]}
-                ]
-              }
-            ]
+            "attachments": [{
+              "color": "COLOR_HERE",
+              "blocks": [
+                { "type": "section", "text": { "type": "mrkdwn", "text": "*MCP Hourly Smoke Test*: EMOJI *STATUS_HERE*" } },
+                { "type": "section", "text": { "type": "mrkdwn", "text": "*Server*: SERVER_NAME_HERE" } },
+                { "type": "context", "elements": [
+                  { "type": "mrkdwn", "text": "<${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}|View workflow run>" }
+                ]}
+              ]
+            }]
           }
           JSON
-          )
+      
           PAYLOAD="${PAYLOAD//STATUS_HERE/${STATUS^^}}"
           PAYLOAD="${PAYLOAD//SERVER_NAME_HERE/${SERVER_NAME:-unknown}}"
           PAYLOAD="${PAYLOAD//COLOR_HERE/$COLOR}"
           PAYLOAD="${PAYLOAD//EMOJI/$EMOJI}"
-          curl -X POST -H 'Content-type: application/json' --data "$PAYLOAD" "$DEV_SLACK_WEBHOOK_URL"
+      
+          curl -sS -X POST -H 'Content-type: application/json' --data "$PAYLOAD" "$DEV_SLACK_WEBHOOK_URL" || echo "::warning::Slack notification failed"
