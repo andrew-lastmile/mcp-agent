@@ -144,7 +144,7 @@ jobs:
       # --- No cleanup step (nothing to tear down) ---
 
       # --- Rich Slack notification ---
-      - name: Notify Slack (Hourly MCP smoke test)
+      - name: Notify Slack
         if: always()
         uses: slackapi/slack-github-action@v2.1.1
         with:
@@ -152,7 +152,6 @@ jobs:
           webhook-type: incoming-webhook
           payload: |
             {
-              "text": "Hourly MCP smoke test",
               "attachments": [
                 {
                   "color": "${{ env.STATUS == 'success' && '#36a64f' || env.STATUS == 'failure' && '#e01e5a' || '#f2c744' }}",
