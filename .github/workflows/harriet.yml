@@ -11,6 +11,7 @@ permissions:
 concurrency:
   group: hourly-mcp-test
   cancel-in-progress: true
+
 jobs:
   test-app:
     runs-on: ubuntu-latest
@@ -36,62 +37,191 @@ jobs:
         run: |
           printf "[pytest]\nasyncio_mode = auto\nmarkers =\n    asyncio: mark test as asyncio\n" > pytest.ini
 
+      # Run only test_app.py, capture latency + JSON summary + full log
       - name: Run only test_app.py
+        id: test
         run: |
-          set -euo pipefail
+          set -uo pipefail
+
           if [ -f tests/test_app.py ]; then
-            pytest -q tests/test_app.py
+            TARGET="tests/test_app.py"
           elif [ -f test_app.py ]; then
-            pytest -q test_app.py
+            TARGET="test_app.py"
           else
             echo "Could not find test_app.py" >&2
             exit 1
           fi
 
-      - name: Slack notify (Hourly MCP smoke test)
+          start=$(date +%s)
+
+          # allow pytest to fail without aborting the script immediately
+          set +e
+          pytest -q "$TARGET" | tee full_test.log
+          EXIT_CODE=$?
+          set -e
+
+          if [ "$EXIT_CODE" -eq 0 ]; then
+            SUCCESS=true
+          else
+            SUCCESS=false
+          fi
+
+          end=$(date +%s)
+          LATENCY=$((end - start))
+
+          # Minimal JSON summary for downstream steps
+          cat > test_output.json <<EOF
+{"success": $SUCCESS, "latency_s": $LATENCY}
+EOF
+
+          exit "$EXIT_CODE"
+
+      - name: Normalize status
+        id: normalize
         if: always()
         env:
-          STATUS: ${{ job.status }}
-          SERVER_NAME: ${{ vars.MCP_SERVER_NAME }}
-          DEV_SLACK_WEBHOOK_URL: ${{ secrets.DEV_SLACK_WEBHOOK_URL }}
+          TEST_OUTCOME: ${{ steps.test.outcome }}   # success | failure | cancelled | skipped
         run: |
-          set -euo pipefail
+          set -e
 
-          # bail out quietly if the single chosen webhook isn't set
-          if [[ -z "${DEV_SLACK_WEBHOOK_URL:-}" ]]; then
-            echo "::notice::DEV_SLACK_WEBHOOK_URL is empty; skipping Slack notification."
-            exit 0
+          case "$TEST_OUTCOME" in
+            failure)
+              STATUS="failure"
+              ;;
+            cancelled|skipped|"")
+              # Tests never really ran → canary-down
+              STATUS="canary-down"
+              ;;
+            success)
+              # Tests ran; trust JSON if present, else treat as failure
+              if jq -e .success test_output.json >/dev/null 2>&1 && \
+                 [ "$(jq -r '.success' test_output.json)" = "true" ]; then
+                STATUS="success"
+              else
+                STATUS="failure"
+              fi
+              ;;
+            *)
+              STATUS="canary-down"
+              ;;
+          esac
+
+          echo "STATUS=$STATUS" >> "$GITHUB_ENV"
+          echo "::notice title=Normalized status::$STATUS"
+
+      - name: Log results
+        id: log
+        if: always()
+        env:
+          SERVER_NAME: ${{ vars.MCP_SERVER_NAME }}
+        run: |
+          set -e
+
+          # App ID: prefer JSON field, fall back to server name
+          APP_ID=$(
+            [ -f test_output.json ] && jq -r '.app_id // empty' test_output.json || echo ""
+          )
+          if [ -z "$APP_ID" ]; then
+            APP_ID="$SERVER_NAME"
           fi
 
-          if [[ "${STATUS}" == "success" ]]; then
-            EMOJI="✅"
-            COLOR="#2eb886"
-          else
-            EMOJI="❌"
-            COLOR="#e01e5a"
-          fi
+          TEST_LATENCY=$(
+            [ -f test_output.json ] && jq -r '.latency_s // 0' test_output.json || echo 0
+          )
+          TOTAL_LATENCY="$TEST_LATENCY"
 
-          PAYLOAD=$(cat <<JSON
-          {
-            "text": "Hourly MCP smoke test",
-            "attachments": [{
-              "color": "COLOR_HERE",
-              "blocks": [
-                { "type": "section", "text": { "type": "mrkdwn", "text": "*MCP Hourly Smoke Test*: EMOJI *STATUS_HERE*" } },
-                { "type": "section", "text": { "type": "mrkdwn", "text": "*Server*: SERVER_NAME_HERE" } },
-                { "type": "context", "elements": [
-                  { "type": "mrkdwn", "text": "<${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}|View workflow run>" }
-                ]}
-              ]
-            }]
-          }
-          JSON
+          TEST_SUCCESS=$(
+            [ -f test_output.json ] && jq -r '.success // false' test_output.json || echo false
           )
 
-          PAYLOAD="${PAYLOAD//STATUS_HERE/${STATUS^^}}"
-          PAYLOAD="${PAYLOAD//SERVER_NAME_HERE/${SERVER_NAME:-unknown}}"
-          PAYLOAD="${PAYLOAD//COLOR_HERE/$COLOR}"
-          PAYLOAD="${PAYLOAD//EMOJI/$EMOJI}"
+          # Trimmed test output for Slack (last 1000 chars)
+          TEST_STDOUT=$(
+            [ -f full_test.log ] && tail -c 1000 full_test.log || echo ""
+          )
 
-          curl -sS -X POST -H 'Content-type: application/json' --data "$PAYLOAD" "$DEV_SLACK_WEBHOOK_URL" \
-            || echo "::warning::Slack notification failed"
+          STATUS="${STATUS:-${{ env.STATUS }}}"
+
+          echo "📊 Logging MCP test results (app_id=$APP_ID status=$STATUS)"
+          echo "  Test latency:  ${TEST_LATENCY}s"
+          echo "  Total latency: ${TOTAL_LATENCY}s"
+
+          # Escape logs safely for Slack JSON
+          TEST_STDOUT_ESCAPED=$(echo "$TEST_STDOUT" | jq -Rs .)
+
+          {
+            echo "APP_ID=$APP_ID"
+            echo "TEST_LATENCY=$TEST_LATENCY"
+            echo "TOTAL_LATENCY=$TOTAL_LATENCY"
+            echo "TEST_SUCCESS=$TEST_SUCCESS"
+            echo "TEST_STDOUT_ESCAPED=$TEST_STDOUT_ESCAPED"
+          } >> "$GITHUB_ENV"
+
+      # No cleanup step — nothing to tear down
+
+      - name: Notify Slack (Hourly MCP smoke test)
+        if: always()
+        uses: slackapi/slack-github-action@v2.1.1
+        with:
+          webhook: ${{ secrets.DEV_SLACK_WEBHOOK_URL }}
+          webhook-type: incoming-webhook
+          payload: |
+            {
+              "text": "Hourly MCP smoke test",
+              "attachments": [
+                {
+                  "color": "${{ env.STATUS == 'success' && '#36a64f' || env.STATUS == 'failure' && '#e01e5a' || '#f2c744' }}",
+                  "blocks": [
+                    {
+                      "type": "context",
+                      "elements": [
+                        { "type": "mrkdwn", "text": "*App ID:* `${{ env.APP_ID }}`" }
+                      ]
+                    },
+                    {
+                      "type": "context",
+                      "elements": [
+                        { "type": "mrkdwn", "text": "*Status:* `${{ env.STATUS }}`" },
+                        { "type": "mrkdwn", "text": "*Tool Calls:* ${{ env.TEST_SUCCESS == 'true' && '✅' || '❌' }}" }
+                      ]
+                    },
+                    {
+                      "type": "context",
+                      "elements": [
+                        { "type": "mrkdwn", "text": "*Total latency:* `${{ env.TOTAL_LATENCY }}s`" },
+                        { "type": "mrkdwn", "text": "*Test latency:* `${{ env.TEST_LATENCY }}s`" }
+                      ]
+                    },
+
+                    { "type": "divider" },
+
+                    {
+                      "type": "context",
+                      "elements": [
+                        {
+                          "type": "mrkdwn",
+                          "text": "${{ env.TEST_SUCCESS == 'true' && '✅ *Tool Call Output*' || '❌ *Tool Call Output*' }}"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "context",
+                      "elements": [
+                        {
+                          "type": "mrkdwn",
+                          "text": ${{ env.TEST_STDOUT_ESCAPED }}
+                        }
+                      ]
+                    },
+                    {
+                      "type": "context",
+                      "elements": [
+                        {
+                          "type": "mrkdwn",
+                          "text": "_Triggered by <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|Harriet Canary>_"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
