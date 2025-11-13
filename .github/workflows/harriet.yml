@@ -71,8 +71,8 @@ jobs:
 
           # Minimal JSON summary for downstream steps
           cat > test_output.json <<EOF
-{"success": $SUCCESS, "latency_s": $LATENCY}
-EOF
+          {"success": $SUCCESS, "latency_s": $LATENCY}
+          EOF
 
           exit "$EXIT_CODE"
 
