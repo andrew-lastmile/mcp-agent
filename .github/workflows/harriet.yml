@@ -36,14 +36,11 @@ jobs:
           pip install -e .
           pip install pytest pytest-asyncio fastmcp
 
-      # optional: silence "Unknown pytest.mark.asyncio" warnings without committing a file
-      - name: Add pytest.ini for asyncio mode
-        run: |
-          printf "[pytest]\nasyncio_mode = auto\nmarkers =\n    asyncio: mark test as asyncio\n" > pytest.ini
-
       # --- Test the MCP app using your test_app.py script ---
       - name: Test app
-        id: test
+        id: test  
+        env:
+          MCPAC_API_KEY: ${{ secrets.MCPAC_API_KEY }}
         run: |
           set -euo pipefail
           echo "Testing MCP app at: $APP_URL"
