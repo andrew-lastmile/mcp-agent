@@ -54,7 +54,7 @@ jobs:
           # Use a variable or hard-code the name
           SERVER_NAME: ${{ vars.MCP_SERVER_NAME }}
           # 👇 map the GitHub secret into the env var your script expects
-          DEV_SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          DEV_SLACK_WEBHOOK_URL: ${{ secrets.DEV_SLACK_WEBHOOK_URL }}
         run: |
           set -euo pipefail
       
