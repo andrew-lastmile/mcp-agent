@@ -14,7 +14,7 @@ concurrency:
 
 # Make the MCP URL available to all steps
 env:
-  APP_URL: ${{ env.HARRIET_MCP_SERVER_URL }}
+  APP_URL: ${{ vars.HARRIET_MCP_SERVER_URL }}
   
 jobs:
   test-app:
