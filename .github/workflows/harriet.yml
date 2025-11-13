@@ -12,6 +12,10 @@ concurrency:
   group: hourly-mcp-test
   cancel-in-progress: true
 
+# Make the MCP URL available to all steps
+env:
+  APP_URL: ${{ secrets.MCP_SERVER_URL_ALT }}
+
 jobs:
   test-app:
     runs-on: ubuntu-latest
@@ -37,45 +41,20 @@ jobs:
         run: |
           printf "[pytest]\nasyncio_mode = auto\nmarkers =\n    asyncio: mark test as asyncio\n" > pytest.ini
 
-      # Run only test_app.py, capture latency + JSON summary + full log
-      - name: Run only test_app.py
+      # --- Test the MCP app using your test_app.py script ---
+      - name: Test app
         id: test
         run: |
-          set -uo pipefail
+          set -euo pipefail
+          echo "Testing MCP app at: $APP_URL"
+          
+          # Run canary/test_app.py with APP_URL, stream logs to console,
+          # capture full log, and write final JSON line to test_output.json
+          python canary/test_app.py "$APP_URL" \
+            | tee full_test.log \
+            | tail -n 1 > test_output.json || exit 1
 
-          if [ -f tests/test_app.py ]; then
-            TARGET="tests/test_app.py"
-          elif [ -f test_app.py ]; then
-            TARGET="test_app.py"
-          else
-            echo "Could not find test_app.py" >&2
-            exit 1
-          fi
-
-          start=$(date +%s)
-
-          # allow pytest to fail without aborting the script immediately
-          set +e
-          pytest -q "$TARGET" | tee full_test.log
-          EXIT_CODE=$?
-          set -e
-
-          if [ "$EXIT_CODE" -eq 0 ]; then
-            SUCCESS=true
-          else
-            SUCCESS=false
-          fi
-
-          end=$(date +%s)
-          LATENCY=$((end - start))
-
-          # Minimal JSON summary for downstream steps
-          cat > test_output.json <<EOF
-          {"success": $SUCCESS, "latency_s": $LATENCY}
-          EOF
-
-          exit "$EXIT_CODE"
-
+      # --- Normalize status based on test outcome + JSON success flag ---
       - name: Normalize status
         id: normalize
         if: always()
@@ -109,22 +88,16 @@ jobs:
           echo "STATUS=$STATUS" >> "$GITHUB_ENV"
           echo "::notice title=Normalized status::$STATUS"
 
+      # --- Log results (no cleanup) ---
       - name: Log results
         id: log
         if: always()
-        env:
-          SERVER_NAME: ${{ vars.MCP_SERVER_NAME }}
         run: |
           set -e
 
-          # App ID: prefer JSON field, fall back to server name
-          APP_ID=$(
-            [ -f test_output.json ] && jq -r '.app_id // empty' test_output.json || echo ""
-          )
-          if [ -z "$APP_ID" ]; then
-            APP_ID="$SERVER_NAME"
-          fi
+          APP_URL_VALUE="${APP_URL:-unknown}"
 
+          # Pull latency & success from test_output.json if present
           TEST_LATENCY=$(
             [ -f test_output.json ] && jq -r '.latency_s // 0' test_output.json || echo 0
           )
@@ -134,30 +107,46 @@ jobs:
             [ -f test_output.json ] && jq -r '.success // false' test_output.json || echo false
           )
 
-          # Trimmed test output for Slack (last 1000 chars)
+          # Trimmed tool output: use the JSON stdout field
           TEST_STDOUT=$(
-            [ -f full_test.log ] && tail -c 1000 full_test.log || echo ""
+            [ -f test_output.json ] && jq -r '.stdout // ""' test_output.json || echo ""
           )
 
-          STATUS="${STATUS:-${{ env.STATUS }}}"
+          STATUS="${{ env.STATUS }}"
 
-          echo "📊 Logging MCP test results (app_id=$APP_ID status=$STATUS)"
+          echo "📊 Logging MCP test results (app_url=$APP_URL_VALUE status=$STATUS)"
           echo "  Test latency:  ${TEST_LATENCY}s"
           echo "  Total latency: ${TOTAL_LATENCY}s"
+
+          # You can treat "deploy" fields as zero/empty since there's no deploy step
+          DEPLOY_LATENCY=0
+          DEPLOY_STDOUT=""
+
+          python canary/log_result.py \
+            "$STATUS" \
+            "$APP_URL_VALUE" \
+            "$TOTAL_LATENCY" \
+            "$DEPLOY_LATENCY" \
+            "$TEST_LATENCY" \
+            "$DEPLOY_STDOUT" \
+            "" \
+            "$TEST_STDOUT" \
+            ""
 
           # Escape logs safely for Slack JSON
           TEST_STDOUT_ESCAPED=$(echo "$TEST_STDOUT" | jq -Rs .)
 
           {
-            echo "APP_ID=$APP_ID"
+            echo "APP_URL=$APP_URL_VALUE"
             echo "TEST_LATENCY=$TEST_LATENCY"
             echo "TOTAL_LATENCY=$TOTAL_LATENCY"
             echo "TEST_SUCCESS=$TEST_SUCCESS"
             echo "TEST_STDOUT_ESCAPED=$TEST_STDOUT_ESCAPED"
           } >> "$GITHUB_ENV"
 
-      # No cleanup step — nothing to tear down
+      # --- No cleanup step (nothing to tear down) ---
 
+      # --- Rich Slack notification ---
       - name: Notify Slack (Hourly MCP smoke test)
         if: always()
         uses: slackapi/slack-github-action@v2.1.1
@@ -174,7 +163,7 @@ jobs:
                     {
                       "type": "context",
                       "elements": [
-                        { "type": "mrkdwn", "text": "*App ID:* `${{ env.APP_ID }}`" }
+                        { "type": "mrkdwn", "text": "*App URL:* `${{ env.APP_URL }}`" }
                       ]
                     },
                     {
@@ -188,7 +177,7 @@ jobs:
                       "type": "context",
                       "elements": [
                         { "type": "mrkdwn", "text": "*Total latency:* `${{ env.TOTAL_LATENCY }}s`" },
-                        { "type": "mrkdwn", "text": "*Test latency:* `${{ env.TEST_LATENCY }}s`" }
+                        { "type": "mrkdwn", "text": "*Tool Calls latency:* `${{ env.TEST_LATENCY }}s`" }
                       ]
                     },
 
