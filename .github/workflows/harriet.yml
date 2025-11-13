@@ -12,9 +12,10 @@ concurrency:
   group: hourly-mcp-test
   cancel-in-progress: true
 
-# Make the MCP URL available to all steps
+# Make the MCP URLs available to all steps
 env:
   APP_URL: ${{ vars.HARRIET_MCP_SERVER_URL }}
+  NO_AUTH_APP_URL: ${{ vars.HARRIET_NO_AUTH_MCP_SERVER_URL }}
   
 jobs:
   test-app:
@@ -36,54 +37,90 @@ jobs:
           pip install -e .
           pip install pytest pytest-asyncio fastmcp
 
-      # --- Test the MCP app using your test_app.py script ---
-      - name: Test app
-        id: test  
+      # --- Test the MCP app (auth-required URL) ---
+      - name: Test app (auth)
+        id: test_auth
+        continue-on-error: true
         env:
           MCPAC_API_KEY: ${{ secrets.MCPAC_API_KEY }}
         run: |
           set -euo pipefail
-          echo "Testing MCP app at: $APP_URL"
+          echo "Testing MCP app at (auth): $APP_URL"
           
           # Run canary/test_app.py with APP_URL, stream logs to console,
-          # capture full log, and write final JSON line to test_output.json
+          # capture full log, and write final JSON line to test_output_auth.json
           python canary/test_app.py "$APP_URL" \
-            | tee full_test.log \
-            | tail -n 1 > test_output.json || exit 1
+            | tee full_test_auth.log \
+            | tail -n 1 > test_output_auth.json
 
-      # --- Normalize status based on test outcome + JSON success flag ---
+      # --- Test the MCP app (no-auth URL, no MCPAC_API_KEY) ---
+      - name: Test app (no-auth)
+        id: test_no_auth
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          echo "Testing MCP app at (no-auth): $NO_AUTH_APP_URL"
+          
+          python canary/test_app.py "$NO_AUTH_APP_URL" \
+            | tee full_test_no_auth.log \
+            | tail -n 1 > test_output_no_auth.json
+
+      # --- Normalize status for each test and overall ---
       - name: Normalize status
         id: normalize
         if: always()
         env:
-          TEST_OUTCOME: ${{ steps.test.outcome }}   # success | failure | cancelled | skipped
+          AUTH_OUTCOME: ${{ steps.test_auth.outcome }}      # success | failure | cancelled | skipped
+          NO_AUTH_OUTCOME: ${{ steps.test_no_auth.outcome }}
         run: |
           set -e
 
-          case "$TEST_OUTCOME" in
-            failure)
-              STATUS="failure"
-              ;;
-            cancelled|skipped|"")
-              # Tests never really ran → canary-down
-              STATUS="canary-down"
-              ;;
-            success)
-              # Tests ran; trust JSON if present, else treat as failure
-              if jq -e .success test_output.json >/dev/null 2>&1 && \
-                 [ "$(jq -r '.success' test_output.json)" = "true" ]; then
-                STATUS="success"
-              else
-                STATUS="failure"
-              fi
-              ;;
-            *)
-              STATUS="canary-down"
-              ;;
-          esac
+          derive_status () {
+            local outcome="$1"
+            local json_file="$2"
+            local status="canary-down"
 
+            case "$outcome" in
+              failure)
+                status="failure"
+                ;;
+              cancelled|skipped|"")
+                status="canary-down"
+                ;;
+              success)
+                if jq -e .success "$json_file" >/dev/null 2>&1 && \
+                   [ "$(jq -r '.success' "$json_file")" = "true" ]; then
+                  status="success"
+                else
+                  status="failure"
+                fi
+                ;;
+              *)
+                status="canary-down"
+                ;;
+            esac
+
+            echo "$status"
+          }
+
+          AUTH_STATUS=$(derive_status "$AUTH_OUTCOME" "test_output_auth.json")
+          NO_AUTH_STATUS=$(derive_status "$NO_AUTH_OUTCOME" "test_output_no_auth.json")
+
+          if [ "$AUTH_STATUS" = "success" ] && [ "$NO_AUTH_STATUS" = "success" ]; then
+            STATUS="success"
+          elif [ "$AUTH_STATUS" = "canary-down" ] && [ "$NO_AUTH_STATUS" = "canary-down" ]; then
+            STATUS="canary-down"
+          else
+            STATUS="failure"
+          fi
+
+          echo "AUTH_STATUS=$AUTH_STATUS" >> "$GITHUB_ENV"
+          echo "NO_AUTH_STATUS=$NO_AUTH_STATUS" >> "$GITHUB_ENV"
           echo "STATUS=$STATUS" >> "$GITHUB_ENV"
-          echo "::notice title=Normalized status::$STATUS"
+
+          echo "::notice title=Auth status::$AUTH_STATUS"
+          echo "::notice title=No-auth status::$NO_AUTH_STATUS"
+          echo "::notice title=Normalized overall status::$STATUS"
 
       # --- Log results (no cleanup) ---
       - name: Log results
@@ -93,55 +130,93 @@ jobs:
           set -e
 
           APP_URL_VALUE="${APP_URL:-unknown}"
+          NO_AUTH_APP_URL_VALUE="${NO_AUTH_APP_URL:-unknown}"
 
-          # Pull latency & success from test_output.json if present
-          TEST_LATENCY=$(
-            [ -f test_output.json ] && jq -r '.latency_s // 0' test_output.json || echo 0
+          # Pull latency & success from test_output_auth.json if present
+          AUTH_TEST_LATENCY=$(
+            [ -f test_output_auth.json ] && jq -r '.latency_s // 0' test_output_auth.json || echo 0
           )
-          TOTAL_LATENCY="$TEST_LATENCY"
-
-          TEST_SUCCESS=$(
-            [ -f test_output.json ] && jq -r '.success // false' test_output.json || echo false
+          AUTH_TEST_SUCCESS=$(
+            [ -f test_output_auth.json ] && jq -r '.success // false' test_output_auth.json || echo false
+          )
+          AUTH_TEST_STDOUT=$(
+            [ -f test_output_auth.json ] && jq -r '.stdout // ""' test_output_auth.json || echo ""
           )
 
-          # Trimmed tool output: use the JSON stdout field
-          TEST_STDOUT=$(
-            [ -f test_output.json ] && jq -r '.stdout // ""' test_output.json || echo ""
+          # Pull latency & success from test_output_no_auth.json if present
+          NO_AUTH_TEST_LATENCY=$(
+            [ -f test_output_no_auth.json ] && jq -r '.latency_s // 0' test_output_no_auth.json || echo 0
+          )
+          NO_AUTH_TEST_SUCCESS=$(
+            [ -f test_output_no_auth.json ] && jq -r '.success // false' test_output_no_auth.json || echo false
+          )
+          NO_AUTH_TEST_STDOUT=$(
+            [ -f test_output_no_auth.json ] && jq -r '.stdout // ""' test_output_no_auth.json || echo ""
+          )
+
+          # Compute total latency as sum of both
+          export AUTH_TEST_LATENCY NO_AUTH_TEST_LATENCY
+          TOTAL_LATENCY=$(python - << 'PY'
+          import os
+          a = float(os.environ.get("AUTH_TEST_LATENCY", 0) or 0)
+          b = float(os.environ.get("NO_AUTH_TEST_LATENCY", 0) or 0)
+          print(a + b)
+          PY
           )
 
           STATUS="${{ env.STATUS }}"
+          AUTH_STATUS="${{ env.AUTH_STATUS }}"
+          NO_AUTH_STATUS="${{ env.NO_AUTH_STATUS }}"
 
-          echo "📊 Logging MCP test results (app_url=$APP_URL_VALUE status=$STATUS)"
-          echo "  Test latency:  ${TEST_LATENCY}s"
+          echo "📊 Logging MCP test results"
+          echo "  Auth URL:     $APP_URL_VALUE (status=$AUTH_STATUS, success=$AUTH_TEST_SUCCESS, latency=${AUTH_TEST_LATENCY}s)"
+          echo "  No-auth URL:  $NO_AUTH_APP_URL_VALUE (status=$NO_AUTH_STATUS, success=$NO_AUTH_TEST_SUCCESS, latency=${NO_AUTH_TEST_LATENCY}s)"
           echo "  Total latency: ${TOTAL_LATENCY}s"
+          echo "  Overall status: $STATUS"
 
           # You can treat "deploy" fields as zero/empty since there's no deploy step
           DEPLOY_LATENCY=0
           DEPLOY_STDOUT=""
 
+          # Log auth URL result
           python canary/log_result.py \
-            "$STATUS" \
+            "$AUTH_STATUS" \
             "$APP_URL_VALUE" \
-            "$TOTAL_LATENCY" \
+            "$AUTH_TEST_LATENCY" \
             "$DEPLOY_LATENCY" \
-            "$TEST_LATENCY" \
+            "$AUTH_TEST_LATENCY" \
             "$DEPLOY_STDOUT" \
             "" \
-            "$TEST_STDOUT" \
+            "$AUTH_TEST_STDOUT" \
+            ""
+
+          # Log no-auth URL result
+          python canary/log_result.py \
+            "$NO_AUTH_STATUS" \
+            "$NO_AUTH_APP_URL_VALUE" \
+            "$NO_AUTH_TEST_LATENCY" \
+            "$DEPLOY_LATENCY" \
+            "$NO_AUTH_TEST_LATENCY" \
+            "$DEPLOY_STDOUT" \
+            "" \
+            "$NO_AUTH_TEST_STDOUT" \
             ""
 
           # Escape logs safely for Slack JSON
-          TEST_STDOUT_ESCAPED=$(echo "$TEST_STDOUT" | jq -Rs .)
+          AUTH_TEST_STDOUT_ESCAPED=$(echo "$AUTH_TEST_STDOUT" | jq -Rs .)
+          NO_AUTH_TEST_STDOUT_ESCAPED=$(echo "$NO_AUTH_TEST_STDOUT" | jq -Rs .)
 
           {
             echo "APP_URL=$APP_URL_VALUE"
-            echo "TEST_LATENCY=$TEST_LATENCY"
+            echo "NO_AUTH_APP_URL=$NO_AUTH_APP_URL_VALUE"
+            echo "AUTH_TEST_LATENCY=$AUTH_TEST_LATENCY"
+            echo "NO_AUTH_TEST_LATENCY=$NO_AUTH_TEST_LATENCY"
             echo "TOTAL_LATENCY=$TOTAL_LATENCY"
-            echo "TEST_SUCCESS=$TEST_SUCCESS"
-            echo "TEST_STDOUT_ESCAPED=$TEST_STDOUT_ESCAPED"
+            echo "AUTH_TEST_SUCCESS=$AUTH_TEST_SUCCESS"
+            echo "NO_AUTH_TEST_SUCCESS=$NO_AUTH_TEST_SUCCESS"
+            echo "AUTH_TEST_STDOUT_ESCAPED=$AUTH_TEST_STDOUT_ESCAPED"
+            echo "NO_AUTH_TEST_STDOUT_ESCAPED=$NO_AUTH_TEST_STDOUT_ESCAPED"
           } >> "$GITHUB_ENV"
-
-      # --- No cleanup step (nothing to tear down) ---
 
       # --- Rich Slack notification ---
       - name: Notify Slack
@@ -159,21 +234,34 @@ jobs:
                     {
                       "type": "context",
                       "elements": [
-                        { "type": "mrkdwn", "text": "*App URL:* `${{ env.APP_URL }}`" }
+                        { "type": "mrkdwn", "text": "*Auth App URL:* `${{ env.APP_URL }}`" }
                       ]
                     },
                     {
                       "type": "context",
                       "elements": [
-                        { "type": "mrkdwn", "text": "*Status:* `${{ env.STATUS }}`" },
-                        { "type": "mrkdwn", "text": "*Tool Calls:* ${{ env.TEST_SUCCESS == 'true' && '✅' || '❌' }}" }
+                        { "type": "mrkdwn", "text": "*No-auth App URL:* `${{ env.NO_AUTH_APP_URL }}`" }
                       ]
                     },
                     {
                       "type": "context",
                       "elements": [
-                        { "type": "mrkdwn", "text": "*Total latency:* `${{ env.TOTAL_LATENCY }}s`" },
-                        { "type": "mrkdwn", "text": "*Tool Calls latency:* `${{ env.TEST_LATENCY }}s`" }
+                        { "type": "mrkdwn", "text": "*Overall Status:* `${{ env.STATUS }}`" }
+                      ]
+                    },
+                    {
+                      "type": "context",
+                      "elements": [
+                        { "type": "mrkdwn", "text": "*Auth MCP:* ${{ env.AUTH_STATUS == 'success' && '✅' || '❌' }} (`${{ env.AUTH_STATUS }}`)" },
+                        { "type": "mrkdwn", "text": "*No-auth MCP:* ${{ env.NO_AUTH_STATUS == 'success' && '✅' || '❌' }} (`${{ env.NO_AUTH_STATUS }}`)" }
+                      ]
+                    },
+                    {
+                      "type": "context",
+                      "elements": [
+                        { "type": "mrkdwn", "text": "*Auth latency:* `${{ env.AUTH_TEST_LATENCY }}s`" },
+                        { "type": "mrkdwn", "text": "*No-auth latency:* `${{ env.NO_AUTH_TEST_LATENCY }}s`" },
+                        { "type": "mrkdwn", "text": "*Total latency:* `${{ env.TOTAL_LATENCY }}s`" }
                       ]
                     },
 
@@ -184,7 +272,7 @@ jobs:
                       "elements": [
                         {
                           "type": "mrkdwn",
-                          "text": "${{ env.TEST_SUCCESS == 'true' && '✅ *Tool Call Output*' || '❌ *Tool Call Output*' }}"
+                          "text": "${{ env.AUTH_STATUS == 'success' && '✅ *Auth Tool Call Output*' || '❌ *Auth Tool Call Output*' }}"
                         }
                       ]
                     },
@@ -193,7 +281,26 @@ jobs:
                       "elements": [
                         {
                           "type": "mrkdwn",
-                          "text": ${{ env.TEST_STDOUT_ESCAPED }}
+                          "text": ${{ env.AUTH_TEST_STDOUT_ESCAPED }}
+                        }
+                      ]
+                    },
+
+                    {
+                      "type": "context",
+                      "elements": [
+                        {
+                          "type": "mrkdwn",
+                          "text": "${{ env.NO_AUTH_STATUS == 'success' && '✅ *No-auth Tool Call Output*' || '❌ *No-auth Tool Call Output*' }}"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "context",
+                      "elements": [
+                        {
+                          "type": "mrkdwn",
+                          "text": ${{ env.NO_AUTH_TEST_STDOUT_ESCAPED }}
                         }
                       ]
                     },
