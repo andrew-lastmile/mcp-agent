@@ -52,22 +52,26 @@ jobs:
         if: always()
         env:
           STATUS: ${{ job.status }}
-          # Use a variable or hard-code the name
           SERVER_NAME: ${{ vars.MCP_SERVER_NAME }}
-          # 👇 map the GitHub secret into the env var your script expects
           DEV_SLACK_WEBHOOK_URL: ${{ secrets.DEV_SLACK_WEBHOOK_URL }}
         run: |
           set -euo pipefail
-      
+
           # bail out quietly if the single chosen webhook isn't set
           if [[ -z "${DEV_SLACK_WEBHOOK_URL:-}" ]]; then
             echo "::notice::DEV_SLACK_WEBHOOK_URL is empty; skipping Slack notification."
             exit 0
           fi
-      
-          if [[ "${STATUS}" == "success" ]]; then EMOJI="✅"; COLOR="#2eb886"; else EMOJI="❌"; COLOR="#e01e5a"; fi
-      
-          read -r -d '' PAYLOAD <<'JSON'
+
+          if [[ "${STATUS}" == "success" ]]; then
+            EMOJI="✅"
+            COLOR="#2eb886"
+          else
+            EMOJI="❌"
+            COLOR="#e01e5a"
+          fi
+
+          PAYLOAD=$(cat <<JSON
           {
             "text": "Hourly MCP smoke test",
             "attachments": [{
@@ -82,10 +86,12 @@ jobs:
             }]
           }
           JSON
-      
+          )
+
           PAYLOAD="${PAYLOAD//STATUS_HERE/${STATUS^^}}"
           PAYLOAD="${PAYLOAD//SERVER_NAME_HERE/${SERVER_NAME:-unknown}}"
           PAYLOAD="${PAYLOAD//COLOR_HERE/$COLOR}"
           PAYLOAD="${PAYLOAD//EMOJI/$EMOJI}"
-      
-          curl -sS -X POST -H 'Content-type: application/json' --data "$PAYLOAD" "$DEV_SLACK_WEBHOOK_URL" || echo "::warning::Slack notification failed"
+
+          curl -sS -X POST -H 'Content-type: application/json' --data "$PAYLOAD" "$DEV_SLACK_WEBHOOK_URL" \
+            || echo "::warning::Slack notification failed"
